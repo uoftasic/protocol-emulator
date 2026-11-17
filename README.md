@@ -2,6 +2,49 @@
 
 # Tiny Tapeout Verilog Project Template
 
+## UART controller
+
+The design contains a parameterized `uart_controller` with LSB-first UART
+frames, configurable data width, one or two stop bits, and optional even
+parity. `i_tx_en` and `o_rx_ready` are one-clock events, and `o_tx_busy`
+is high while a frame is being transmitted. The Tiny Tapeout wrapper runs it
+at 8N1, 434 clocks per bit, on the pins in `info.yaml`:
+
+- `ui_in[2]`: UART RX
+- `uo_out[1]`: UART TX
+
+The SPI pins (`ui_in[0]`, `ui_in[1]`, `ui_in[3]`, `uo_out[0]`) and IRQ
+(`uo_out[2]`) are not connected yet. Until the SPI host interface exists, the
+wrapper echoes every received byte back on TX, through a one-byte holding
+register so back-to-back frames are not dropped.
+
+Block-level tests: `cd test/block-level-tests/L2-uart-controller && make`
+(frame format can be changed, e.g. `make PARITY_EN=1 NUM_STOP_BITS=2`).
+
+### Scalable UVM verification
+
+A reusable UVM environment should instantiate the `uart_controller` directly
+and provide:
+
+1. A UART interface with `clk`, reset, RX, TX, transmit request/data, receive
+   data, and ready signals.
+2. A programmer sequencer/driver that sends randomized `i_tx_en` transactions,
+   including back-to-back requests and requests while TX is active.
+3. A UART line monitor that reconstructs frames from `o_uart_tx`, checks start,
+   data, parity, and stop bits, and publishes observed frames.
+4. A UART line driver and monitor for RX stimulus, including baud-rate
+   tolerance, false starts, bad parity, and invalid stop bits.
+5. A scoreboard that compares transmitted and received transactions and a
+   coverage model crossing data width, stop-bit count, parity mode, payload
+   patterns, and reset timing.
+6. Assertions for idle-high TX, stable symbols for `CLK_PER_BIT` clocks,
+   one-cycle `o_rx_ready`, ignored TX requests while busy, and no
+   `o_rx_ready` for malformed frames.
+
+Run the same sequence against multiple parameter sets (for example 7E1,
+8N1, and 8O2) and use a reference UART frame model in the scoreboard rather
+than hard-coding the 8N1 wrapper configuration.
+
 - [Read the documentation for project](docs/info.md)
 
 ## What is Tiny Tapeout?
