@@ -7,11 +7,13 @@
 
 // The UART controller lives in L1-PEm-system/L2-uart-controller/uart-controller.sv.
 
-// Tiny Tapeout pin adapter:
-// ui_in      = transmit data
-// uio_in[0]  = UART RX, uio_in[1] = transmit enable
-// uo_out     = received data
-// uio_out[0] = UART TX
+// Tiny Tapeout pin adapter (pinout from info.yaml):
+//   ui_in[2]  = UART RX        uo_out[1] = UART TX
+//   ui_in[0]  = MOSI, ui_in[1] = SCLK, ui_in[3] = CS_n   (SPI, not yet connected)
+//   uo_out[0] = MISO, uo_out[2] = IRQ                     (not yet connected, held 0)
+//
+// Until the SPI host interface exists, the UART runs in echo mode: every byte
+// received on RX is transmitted back on TX.
 module tt_um_uoftasic_protocol_emulator (
     input  wire [7:0] ui_in,
     output wire [7:0] uo_out,
@@ -23,6 +25,8 @@ module tt_um_uoftasic_protocol_emulator (
     input  wire       rst_n
 );
   wire [7:0] rx_data;
+  wire       rx_ready;
+  wire       uart_tx;
 
   uart_controller #(
       .CLK_PER_BIT(434),
@@ -34,17 +38,20 @@ module tt_um_uoftasic_protocol_emulator (
       .clk       (clk),
       .rst       (1'b0),
       .ares      (!rst_n),
-      .i_uart_rx (uio_in[0]),
-      .o_uart_tx (uio_out[0]),
-      .i_tx_data (ui_in),
-      .i_tx_en   (uio_in[1] && ena),
+      .i_uart_rx (ui_in[2]),
+      .o_uart_tx (uart_tx),
+      .i_tx_data (rx_data),
+      .i_tx_en   (rx_ready),
       .o_rx_data (rx_data),
-      .o_rx_ready()
+      .o_rx_ready(rx_ready)
   );
 
-  assign uo_out  = rx_data;
-  assign uio_out[7:1] = 7'b0;
-  assign uio_oe  = 8'b0000_0001;
+  assign uo_out  = {5'b0, 1'b0 /* IRQ */, uart_tx, 1'b0 /* MISO */};
+  assign uio_out = 8'b0;
+  assign uio_oe  = 8'b0;  // all uio pins are inputs (unused)
+
+  // List all unused inputs to prevent warnings
+  wire _unused = &{ena, ui_in[7:3], ui_in[1:0], uio_in, 1'b0};
 endmodule
 
 `default_nettype wire
