@@ -6,14 +6,20 @@
 
 The design contains a parameterized `uart_controller` with LSB-first UART
 frames, configurable data width, one or two stop bits, and optional even
-parity. `i_tx_en` and `o_rx_ready` are one-clock events. The Tiny Tapeout
-adapter is configured for 8N1 at 434 clocks per bit:
+parity. `i_tx_en` and `o_rx_ready` are one-clock events, and `o_tx_busy`
+is high while a frame is being transmitted. The Tiny Tapeout wrapper runs it
+at 8N1, 434 clocks per bit, on the pins in `info.yaml`:
 
-- `ui_in[7:0]`: transmit data
-- `uio_in[0]`: UART RX
-- `uio_in[1]`: one-cycle transmit enable
-- `uio_out[0]`: UART TX
-- `uo_out[7:0]`: received data
+- `ui_in[2]`: UART RX
+- `uo_out[1]`: UART TX
+
+The SPI pins (`ui_in[0]`, `ui_in[1]`, `ui_in[3]`, `uo_out[0]`) and IRQ
+(`uo_out[2]`) are not connected yet. Until the SPI host interface exists, the
+wrapper echoes every received byte back on TX, through a one-byte holding
+register so back-to-back frames are not dropped.
+
+Block-level tests: `cd test/block-level-tests/L2-uart-controller && make`
+(frame format can be changed, e.g. `make PARITY_EN=1 NUM_STOP_BITS=2`).
 
 ### Scalable UVM verification
 

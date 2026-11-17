@@ -8,6 +8,9 @@
 //   * Parity, when PARITY_EN=1, is even parity.
 //   * TX : a one-clock i_tx_en pulse while the transmitter is idle latches
 //          i_tx_data and starts a frame. Requests while busy are dropped.
+//          o_tx_busy is high from the clock after a request is accepted
+//          until the last stop bit has finished; i_tx_en is accepted
+//          whenever o_tx_busy is low.
 //   * RX : the start bit is re-checked at mid-bit (false starts are ignored),
 //          then each bit is sampled at mid-bit. On a valid frame, o_rx_data
 //          updates and o_rx_ready pulses for one clock. Frames with a bad stop
@@ -39,6 +42,7 @@ module uart_controller #(
     // TX interface
     input  logic [DATA_WIDTH-1:0] i_tx_data,
     input  logic                  i_tx_en,
+    output logic                  o_tx_busy,
 
     // RX interface
     output logic [DATA_WIDTH-1:0] o_rx_data,
@@ -54,72 +58,81 @@ module uart_controller #(
   localparam int STOP_COUNT_WIDTH   = (NUM_STOP_BITS <= 1) ? 1 : $clog2(NUM_STOP_BITS);
   localparam int RX_BIT_COUNT_WIDTH = (NUM_DATA_BITS <= 1) ? 1 : $clog2(NUM_DATA_BITS);
 
-  initial begin
-    if (CLK_PER_BIT < 1 || NUM_DATA_BITS < 1 || NUM_STOP_BITS < 1 ||
-        NUM_STOP_BITS > 2 || DATA_WIDTH < NUM_DATA_BITS) begin
-      $error("Invalid UART parameters");
-    end
+  // Counter end values, sized (by part-select) to match their counters.
+  localparam int BIT_LAST_I   = CLK_PER_BIT - 1;
+  localparam int HALF_LAST_I  = (CLK_PER_BIT / 2) - 1;
+  localparam int FRAME_LAST_I = FRAME_BITS - 1;
+  localparam int DATA_LAST_I  = NUM_DATA_BITS - 1;
+  localparam int STOP_LAST_I  = NUM_STOP_BITS - 1;
+  localparam logic [BIT_COUNT_WIDTH-1:0]    BIT_LAST   = BIT_LAST_I[BIT_COUNT_WIDTH-1:0];
+  localparam logic [BIT_COUNT_WIDTH-1:0]    HALF_LAST  = HALF_LAST_I[BIT_COUNT_WIDTH-1:0];
+  localparam logic [FRAME_COUNT_WIDTH-1:0]  FRAME_LAST = FRAME_LAST_I[FRAME_COUNT_WIDTH-1:0];
+  localparam logic [RX_BIT_COUNT_WIDTH-1:0] DATA_LAST  = DATA_LAST_I[RX_BIT_COUNT_WIDTH-1:0];
+  localparam logic [STOP_COUNT_WIDTH-1:0]   STOP_LAST  = STOP_LAST_I[STOP_COUNT_WIDTH-1:0];
+
+  // Elaboration-time parameter check
+  if (CLK_PER_BIT < 2 || NUM_DATA_BITS < 1 || NUM_STOP_BITS < 1 ||
+      NUM_STOP_BITS > 2 || DATA_WIDTH < NUM_DATA_BITS) begin : g_invalid_params
+    $error("Invalid UART parameters");
   end
 
   // ---------------------------------------------------------------------------
   // TX
   // ---------------------------------------------------------------------------
+  // Everything after the start bit, LSB first: data, [parity], stop bits.
+  localparam int TX_SHIFT_WIDTH = FRAME_BITS - 1;
+
   logic [BIT_COUNT_WIDTH-1:0]   tx_clk_count;
   logic [FRAME_COUNT_WIDTH-1:0] tx_frame_position;
-  logic [DATA_WIDTH-1:0]        tx_data_reg;
-  logic                         tx_parity;
+  logic [TX_SHIFT_WIDTH-1:0]    tx_shift;
+  logic [TX_SHIFT_WIDTH-1:0]    tx_frame_load;
   logic                         tx_active;
   logic                         tx_serial_reg;
 
-  // Line level for a given frame position (0 = start bit).
-  // Declared after the TX registers it reads: Icarus rejects use-before-declaration.
-  function automatic logic uart_tx_symbol(input int position);
-    if (position == 0)
-      return 1'b0;
-    else if (position <= NUM_DATA_BITS)
-      return tx_data_reg[position-1];
-    else if (PARITY_EN != 0 && position == NUM_DATA_BITS + 1)
-      return tx_parity;
-    else
-      return 1'b1;
-  endfunction
+  // Frame contents to load when a request is accepted. Bits above the data
+  // (and parity) default to 1, which are the stop bits.
+  always_comb begin
+    tx_frame_load                      = '1;
+    tx_frame_load[NUM_DATA_BITS-1:0]   = i_tx_data[NUM_DATA_BITS-1:0];
+    if (PARITY_EN != 0)
+      tx_frame_load[NUM_DATA_BITS]     = ^i_tx_data[NUM_DATA_BITS-1:0];
+  end
 
   assign o_uart_tx = tx_serial_reg;
+  assign o_tx_busy = tx_active;
 
   always_ff @(posedge clk or posedge ares) begin
     if (ares) begin
       tx_clk_count      <= '0;
       tx_frame_position <= '0;
-      tx_data_reg       <= '0;
-      tx_parity         <= 1'b0;
+      tx_shift          <= '1;
       tx_active         <= 1'b0;
       tx_serial_reg     <= 1'b1;
     end else if (rst) begin
       tx_clk_count      <= '0;
       tx_frame_position <= '0;
-      tx_data_reg       <= '0;
-      tx_parity         <= 1'b0;
+      tx_shift          <= '1;
       tx_active         <= 1'b0;
       tx_serial_reg     <= 1'b1;
     end else if (!tx_active) begin
       tx_clk_count <= '0;
       if (i_tx_en) begin
-        tx_data_reg       <= i_tx_data;
-        tx_parity         <= ^i_tx_data[NUM_DATA_BITS-1:0];
+        tx_shift          <= tx_frame_load;
         tx_frame_position <= '0;
         tx_active         <= 1'b1;
-        tx_serial_reg     <= 1'b0;
+        tx_serial_reg     <= 1'b0;  // start bit
       end else begin
         tx_serial_reg <= 1'b1;
       end
-    end else if (tx_clk_count == CLK_PER_BIT - 1) begin
+    end else if (tx_clk_count == BIT_LAST) begin
       tx_clk_count <= '0;
-      if (tx_frame_position == FRAME_BITS - 1) begin
+      if (tx_frame_position == FRAME_LAST) begin
         tx_active     <= 1'b0;
         tx_serial_reg <= 1'b1;
       end else begin
         tx_frame_position <= tx_frame_position + 1'b1;
-        tx_serial_reg     <= uart_tx_symbol(int'(tx_frame_position) + 1);
+        tx_serial_reg     <= tx_shift[0];
+        tx_shift          <= {1'b1, tx_shift[TX_SHIFT_WIDTH-1:1]};
       end
     end else begin
       tx_clk_count <= tx_clk_count + 1'b1;
@@ -178,7 +191,7 @@ module uart_controller #(
         end
 
         RX_START: begin
-          if (rx_clk_count == (CLK_PER_BIT / 2) - 1) begin
+          if (rx_clk_count == HALF_LAST) begin
             rx_clk_count    <= '0;
             if (i_uart_rx) rx_state <= RX_IDLE;   // false start
             else           rx_state <= RX_DATA;
@@ -190,11 +203,11 @@ module uart_controller #(
         end
 
         RX_DATA: begin
-          if (rx_clk_count == CLK_PER_BIT - 1) begin
+          if (rx_clk_count == BIT_LAST) begin
             rx_clk_count                 <= '0;
             rx_data_reg[rx_bit_position] <= i_uart_rx;
             rx_parity                    <= rx_parity ^ i_uart_rx;
-            if (rx_bit_position == NUM_DATA_BITS - 1) begin
+            if (rx_bit_position == DATA_LAST) begin
               if (PARITY_EN != 0) rx_state <= RX_PARITY;
               else                rx_state <= RX_STOP;
               rx_stop_position <= '0;
@@ -207,7 +220,7 @@ module uart_controller #(
         end
 
         RX_PARITY: begin
-          if (rx_clk_count == CLK_PER_BIT - 1) begin
+          if (rx_clk_count == BIT_LAST) begin
             rx_clk_count     <= '0;
             rx_parity_error  <= (i_uart_rx != rx_parity);
             rx_stop_position <= '0;
@@ -218,9 +231,9 @@ module uart_controller #(
         end
 
         RX_STOP: begin
-          if (rx_clk_count == CLK_PER_BIT - 1) begin
+          if (rx_clk_count == BIT_LAST) begin
             rx_clk_count <= '0;
-            if (rx_stop_position == NUM_STOP_BITS - 1) begin
+            if (rx_stop_position == STOP_LAST) begin
               if (i_uart_rx && !rx_parity_error) begin
                 o_rx_data  <= rx_data_reg;
                 o_rx_ready <= 1'b1;

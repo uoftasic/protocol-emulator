@@ -13,7 +13,10 @@
 //   uo_out[0] = MISO, uo_out[2] = IRQ                     (not yet connected, held 0)
 //
 // Until the SPI host interface exists, the UART runs in echo mode: every byte
-// received on RX is transmitted back on TX.
+// received on RX is transmitted back on TX. A one-byte holding register keeps
+// a received byte until the transmitter is free, so back-to-back frames at
+// the same baud rate are all echoed. (If RX outpaces TX for longer than one
+// byte, the held byte is overwritten.)
 module tt_um_uoftasic_protocol_emulator (
     input  wire [7:0] ui_in,
     output wire [7:0] uo_out,
@@ -27,6 +30,24 @@ module tt_um_uoftasic_protocol_emulator (
   wire [7:0] rx_data;
   wire       rx_ready;
   wire       uart_tx;
+  wire       tx_busy;
+  reg  [7:0] hold_data;
+  reg        hold_valid;
+  wire       tx_send = hold_valid && !tx_busy;
+
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      hold_data  <= 8'b0;
+      hold_valid <= 1'b0;
+    end else begin
+      if (tx_send)
+        hold_valid <= 1'b0;
+      if (rx_ready) begin  // a new byte wins over clearing the old one
+        hold_data  <= rx_data;
+        hold_valid <= 1'b1;
+      end
+    end
+  end
 
   uart_controller #(
       .CLK_PER_BIT(434),
@@ -40,8 +61,9 @@ module tt_um_uoftasic_protocol_emulator (
       .ares      (!rst_n),
       .i_uart_rx (ui_in[2]),
       .o_uart_tx (uart_tx),
-      .i_tx_data (rx_data),
-      .i_tx_en   (rx_ready),
+      .i_tx_data (hold_data),
+      .i_tx_en   (tx_send),
+      .o_tx_busy (tx_busy),
       .o_rx_data (rx_data),
       .o_rx_ready(rx_ready)
   );

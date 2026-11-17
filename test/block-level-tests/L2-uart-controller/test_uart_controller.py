@@ -124,6 +124,26 @@ async def test_tx_frame_timing(dut):
 
 
 @cocotb.test()
+async def test_tx_busy(dut):
+    """o_tx_busy covers the whole frame, and a request is taken once it drops."""
+    await setup(dut)
+    assert int(dut.o_tx_busy.value) == 0, "busy while idle"
+    await send_tx(dut, 0x5A & DATA_MASK)
+    busy_clocks = 0
+    while int(dut.o_tx_busy.value):
+        busy_clocks += 1
+        await tick(dut)
+    assert busy_clocks == FRAME_BITS * CLK_PER_BIT, f"busy for {busy_clocks} clocks"
+    assert int(dut.o_uart_tx.value) == 1, "line not idle when busy dropped"
+
+    # A request on the first clock busy is low must start a new frame.
+    monitor = cocotb.start_soon(sample_tx_frame(dut))
+    await send_tx(dut, 0xA5 & DATA_MASK)
+    assert int(dut.o_tx_busy.value) == 1, "request right after busy dropped was ignored"
+    assert await monitor == 0xA5 & DATA_MASK
+
+
+@cocotb.test()
 async def test_tx_frames(dut):
     await setup(dut)
     for value in (0x55, 0xA5, 0x00, 0xFF, 0x01, 0x80):
