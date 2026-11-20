@@ -23,3 +23,6 @@ test/block-level-tests/*.fst
 test/block-level-tests/sim_build
 
 .CONTEXT/
+test/block-level-tests/*/*.vcd
+test/block-level-tests/*/*.fst
+test/block-level-tests/*/sim_build
