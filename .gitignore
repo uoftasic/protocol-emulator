@@ -26,3 +26,8 @@ test/block-level-tests/sim_build
 test/block-level-tests/*/*.vcd
 test/block-level-tests/*/*.fst
 test/block-level-tests/*/sim_build
+<<<<<<< HEAD
+=======
+
+.CONTEXT/
+>>>>>>> da1723d (chore: update gitignore)
