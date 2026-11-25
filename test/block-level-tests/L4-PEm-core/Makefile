@@ -1,9 +1,12 @@
-# Makefile — block-level test: sync_fifo
+# Makefile — block-level test: pem_core
 # See https://docs.cocotb.org/en/stable/quickstart.html for more info
 
 # defaults
 SIM ?= icarus
 TOPLEVEL_LANG ?= verilog
+.DEFAULT_GOAL := sim
+PYTHON ?= python3
+VERILATOR ?= verilator
 SRC_DIR = $(CURDIR)/../../../src/L1-PEm-system/L2-PEm-engine/L3-PEm-core-array/L4-PEm-core/
 PROJECT_SOURCES = pem_core.sv clock_divider.sv
 
@@ -12,13 +15,13 @@ SIM_BUILD = sim_build/rtl
 VERILOG_SOURCES += $(addprefix $(SRC_DIR)/,$(PROJECT_SOURCES))
 
 # Allow `include files from the source dir
-COMPILE_ARGS += -I$(SRC_DIR)
+COMPILE_ARGS += -g2012 -I$(SRC_DIR)
 
 # No tb.v wrapper needed: cocotb drives the module directly
-COCOTB_TOPLEVEL = sync_fifo
+COCOTB_TOPLEVEL = pem_core
 
 # Test modules, comma-separated, no .py
-COCOTB_TEST_MODULES = test_fifo
+COCOTB_TEST_MODULES = test_pem_core
 
 # Use a cocotb venv if one exists (override with: make VENV=/path/to/venv)
 VENV ?= $(HOME)/cocotb-env
@@ -26,4 +29,11 @@ ifneq ($(wildcard $(VENV)/bin/cocotb-config),)
 export PATH := $(VENV)/bin:$(PATH)
 endif
 
+.PHONY: lint
+lint:
+	VERILATOR="$(VERILATOR)" $(PYTHON) lint_pem_core.py
+
+ifneq ($(MAKECMDGOALS),lint)
 include $(shell PATH="$(PATH)" cocotb-config --makefiles)/Makefile.sim
+endif
+
