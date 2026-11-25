@@ -4,11 +4,16 @@ Expectations come from .CONTEXT/CONTEXT.md, baseline v0.8. All DUT access is
 through public ports, including architectural register reads through CSR.
 Run `make` with the supplied divider, or `make test-model` to explicitly use
 the test-only Q12.4 divider while its owner's source is empty.
+Use `make coverage USE_DIVIDER_MODEL=1` for optional functional coverage.
 """
 
+from collections import Counter
+from functools import wraps
 from pathlib import Path
+import argparse
+import html
+import json
 import os
-import sys
 
 import cocotb
 from cocotb.triggers import Timer
@@ -49,6 +54,217 @@ LEGAL_WRITES = {
     **{addr: 0x005A for addr in STATE_CSRS},
 }
 STATE_SEED = {X: 0xA6, Y: 0x59, ISR: 0xC3, OSR: 0x96, PIN_OUT: 0xA5, PIN_DIR: 0x5A}
+
+
+class FunctionalCoverage:
+    """Small contract bins sampled through existing black-box checks."""
+
+    def __init__(self):
+        self.path = Path(os.environ["PEM_CORE_COVERAGE_DIR"])
+        self.path.mkdir(parents=True, exist_ok=True)
+        self.bins = {
+            "instruction": ("JMP", "WAIT", "IN", "OUT", "PUSH", "PULL", "MOV", "IRQ", "SET", "NOP"),
+            "reserved_instruction": ("WAIT", "IN", "OUT", "PUSH_PULL", "MOV", "IRQ", "SET"),
+            "csr_read": tuple(f"0x{address:X}" for address in range(16)),
+            "csr_write": tuple(
+                f"0x{address:X}:{result}"
+                for address in range(16)
+                for result in ("accepted", "rejected")
+                if (result == "accepted" and address not in (PC, SHIFT_COUNT))
+                or (result == "rejected" and address not in (SM_CTRL, SM_STATUS))
+            ),
+            "control": ("STEP", "CONT_RUN", "HALT", "FULL_RESET", "LOCAL_RESET", "EXTERNAL_RESET"),
+            "status": ("halted", "running", "invalid") + tuple(
+                f"{phase}:{cause}"
+                for phase in ("stalled", "frozen")
+                for cause in ("pin", "irq", "tx", "rx")
+            ),
+            "link": ("tx", "rx", "fallback", "drop", "autopull", "autopush"),
+            "sync": ("set", "clear", "wait_clear"),
+            "jmp_condition": tuple(str(value) for value in range(8)),
+            "wait_mode": ("PIN:0", "PIN:1", "IRQ:0:absolute", "IRQ:1:absolute",
+                          "IRQ:0:relative", "IRQ:1:relative"),
+            "mov_source": tuple(str(value) for value in (0, 1, 2, 3, 4, 6, 7)),
+            "mov_destination": tuple(str(value) for value in (0, 1, 2, 5, 6, 7)),
+            "mov_operation": ("copy", "invert", "reverse"),
+            "set_destination": tuple(str(value) for value in (0, 1, 2, 4, 5, 7)),
+            "shift": tuple(
+                f"{family}:{direction}:{count}"
+                for family in ("IN", "OUT")
+                for direction in ("left", "right")
+                for count in range(1, 9)
+            ),
+            "shift_count": tuple(
+                f"{register}:{count}"
+                for register in ("ISR", "OSR")
+                for count in range(9)
+            ),
+            "push_pull_mode": tuple(
+                f"{family}:conditional={conditional}:block={block}"
+                for family in ("PUSH", "PULL")
+                for conditional in range(2)
+                for block in range(2)
+            ),
+            "common": ("delay_zero", "delay_nonzero", "sideset_0", "sideset_1", "sideset_2"),
+        }
+        self.counts = Counter()
+        self.pending = Counter()
+        self.passed = []
+        self.failed = []
+        self.write_report()
+
+    def hit(self, group, value):
+        if value not in self.bins[group]:
+            raise AssertionError(f"Undefined functional coverage bin: {group}/{value}")
+        self.pending[group, value] += 1
+
+    def checked_status(self, value):
+        self.hit("status", "running" if value & RUNNING else "halted")
+        if value & INVALID:
+            self.hit("status", "invalid")
+        if value & STALLED:
+            cause = {1: "pin", 2: "irq", 3: "tx", 4: "rx"}.get((value >> 5) & 7)
+            if cause:
+                self.hit("status", f'{"stalled" if value & RUNNING else "frozen"}:{cause}')
+
+    def instruction(self, word, shift_ctrl, pin_ctrl):
+        opcode, operands = word >> 13, word & 255
+        selection = operands >> 5
+        valid = True
+        family = ("JMP", "WAIT", "IN", "OUT", "PUSH_PULL", "MOV", "IRQ", "SET")[opcode]
+        if opcode == 1:
+            source = (operands >> 5) & 3
+            valid = (source == 1 and not operands & 0x18) or (source == 2 and not operands & 8)
+        elif opcode == 2:
+            valid = selection not in (4, 5) and not operands & 0x18
+        elif opcode == 3:
+            valid = selection != 7 and not operands & 0x18
+        elif opcode == 4:
+            valid = not operands & 31
+        elif opcode == 5:
+            valid = selection not in (3, 4) and (operands & 7) != 5 and ((operands >> 3) & 3) != 3
+        elif opcode == 6:
+            valid = not operands & 0x18
+        elif opcode == 7:
+            valid = selection not in (3, 6) and (selection not in (5, 7) or not operands & 0x18)
+        if not valid:
+            self.hit("reserved_instruction", family)
+        else:
+            if opcode == 4:
+                family = "PULL" if operands & 128 else "PUSH"
+            self.hit("instruction", family)
+            if (word & 0xE0FF) == NOP:
+                self.hit("instruction", "NOP")
+            if opcode == 0:
+                self.hit("jmp_condition", str(selection))
+            elif opcode == 1:
+                polarity = operands >> 7
+                mode = f"PIN:{polarity}" if source == 1 else f'IRQ:{polarity}:{"relative" if operands & 16 else "absolute"}'
+                self.hit("wait_mode", mode)
+            elif opcode in (2, 3):
+                direction_bit = 1 if opcode == 2 else 0
+                direction = "right" if shift_ctrl & (1 << direction_bit) else "left"
+                self.hit("shift", f"{family}:{direction}:{operands & 7 or 8}")
+            elif opcode == 4:
+                self.hit("push_pull_mode", f"{family}:conditional={(operands >> 6) & 1}:block={(operands >> 5) & 1}")
+            elif opcode == 5:
+                self.hit("mov_source", str(operands & 7))
+                self.hit("mov_destination", str(selection))
+                self.hit("mov_operation", ("copy", "invert", "reverse")[(operands >> 3) & 3])
+            elif opcode == 7:
+                self.hit("set_destination", str(selection))
+        sideset = (pin_ctrl >> 8) & 3
+        delay = (word >> 8) & ((1 << (5 - sideset)) - 1)
+        self.hit("common", "delay_nonzero" if delay else "delay_zero")
+        self.hit("common", f"sideset_{sideset}")
+
+    def finish(self, name, passed):
+        if passed:
+            self.counts.update(self.pending)
+            self.passed.append(name)
+        else:
+            self.failed.append(name)
+        self.pending.clear()
+        self.write_report()
+
+    def write_report(self):
+        groups = {}
+        for group, values in self.bins.items():
+            hits = {value: self.counts[group, value] for value in values}
+            covered = sum(count > 0 for count in hits.values())
+            groups[group] = {
+                "covered": covered,
+                "total": len(values),
+                "percent": round(100 * covered / len(values), 2),
+                "hits": hits,
+                "missing": [value for value, count in hits.items() if not count],
+            }
+        covered = sum(group["covered"] for group in groups.values())
+        total = sum(group["total"] for group in groups.values())
+        summary = {
+            "kind": "black-box functional coverage; not RTL line/branch coverage",
+            "core_id": CORE_ID,
+            "divider_model": os.environ.get("PEM_CORE_DIVIDER_MODEL") == "1",
+            "passed_tests": self.passed,
+            "failed_tests": self.failed,
+            "covered": covered,
+            "total": total,
+            "percent": round(100 * covered / total, 2),
+            "groups": groups,
+        }
+        (self.path / "coverage.json").write_text(json.dumps(summary, indent=2) + "\n\n")
+        title = f"PEm core functional coverage — CORE_ID={CORE_ID}: {covered}/{total} bins ({summary['percent']}%)"
+        lines = [
+            title,
+            f"Passing tests: {len(self.passed)}; failed tests: {len(self.failed)}",
+            "Only passing-test observations count. No RTL line/branch coverage is measured.",
+            f"Divider: {'test-only model' if summary['divider_model'] else 'owner implementation'}",
+            "",
+        ]
+        rows = []
+        for name, group in groups.items():
+            missing = ", ".join(group["missing"]) or "none"
+            lines.append(f"{name}: {group['covered']}/{group['total']} ({group['percent']}%); missing: {missing}")
+            rows.append(f"<tr><td>{name}</td><td>{group['covered']}/{group['total']}</td>"
+                        f"<td>{group['percent']}%</td><td>{html.escape(missing)}</td></tr>")
+        (self.path / "coverage.txt").write_text("\n".join(lines) + "\n\n")
+        document = f'''<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>PEm functional coverage</title>
+<style>body {{font: 15px sans-serif; margin: 24px; color: #172033;}}
+table {{border-collapse: collapse;}} th, td {{padding: 8px 14px; border: 1px solid #cbd5e1; text-align: left;}}
+th {{background: #e2e8f0;}}</style>
+<h1>{html.escape(title)}</h1>
+<p>{html.escape(lines[1])}. {html.escape(lines[3])}.</p>
+<p>Only passing-test observations count. Bins come from checked instruction completion,
+CSR accesses/readback, and public Link/sync/reset events. This is functional coverage,
+not RTL line/branch coverage or a proof of correctness.</p>
+<table><tr><th>Group</th><th>Hit bins</th><th>Coverage</th><th>Missing bins</th></tr>{"".join(rows)}</table>
+</html>
+
+'''
+        (self.path / "coverage.html").write_text(document)
+
+
+FUNCTIONAL_COVERAGE = None
+if __name__ != "__main__" and os.environ.get("PEM_CORE_COVERAGE") == "1":
+    FUNCTIONAL_COVERAGE = FunctionalCoverage()
+
+
+def core_test():
+    if FUNCTIONAL_COVERAGE is None:
+        return cocotb.test()
+
+    def decorate(function):
+        @wraps(function)
+        async def measured(dut):
+            passed = False
+            try:
+                await function(dut)
+                passed = True
+            finally:
+                FUNCTIONAL_COVERAGE.finish(function.__name__, passed)
+        return cocotb.test()(measured)
+    return decorate
 
 
 def mov_word(destination, operation, source, common=0):
@@ -144,6 +360,10 @@ class PEmBench:
         self.tx_queue = None
         self.flags = None
         self.apply_irq_writes = True
+        self.coverage_instruction = None
+        self.coverage_shift_ctrl = 0
+        self.coverage_pin_ctrl = 0
+        self.coverage_reset_seen = False
         for name in (
             "clk", "rst", "i_soft_reset", "i_halt_req", "i_csr_addr",
             "i_csr_din", "i_csr_wren", "i_imem_din", "i_tx_fifo_data",
@@ -185,6 +405,7 @@ class PEmBench:
             self.dut.i_irq_din.value = (self.flags >> int(self.dut.o_irq_addr.value)) & 1
 
     def capture_transfers(self):
+        self.coverage_reset_seen = False
         edge_events = []
         if int(self.dut.o_tx_fifo_ready.value):
             assert int(self.dut.i_tx_fifo_valid.value), "TX request without a byte"
@@ -210,6 +431,25 @@ class PEmBench:
             and int(self.dut.i_csr_din.value) & RESET
         ):
             assert not edge_events, "reset edge produced a transfer/request"
+            if FUNCTIONAL_COVERAGE is not None:
+                self.coverage_reset_seen = True
+                self.coverage_instruction = None
+                if int(self.dut.rst.value):
+                    self.coverage_shift_ctrl = 0
+                    self.coverage_pin_ctrl = 0
+                    FUNCTIONAL_COVERAGE.hit("control", "FULL_RESET")
+                else:
+                    FUNCTIONAL_COVERAGE.hit("control", "EXTERNAL_RESET" if int(self.dut.i_soft_reset.value) else "LOCAL_RESET")
+        if FUNCTIONAL_COVERAGE is not None:
+            for kind, value in edge_events:
+                if kind == "irq":
+                    FUNCTIONAL_COVERAGE.hit("sync", "wait_clear" if value[2] else "set" if value[1] else "clear")
+                else:
+                    FUNCTIONAL_COVERAGE.hit("link", kind)
+                    if self.coverage_instruction is not None:
+                        opcode = self.coverage_instruction[0] >> 13
+                        if (kind, opcode) in (("tx", 3), ("rx", 2)):
+                            FUNCTIONAL_COVERAGE.hit("link", "autopull" if kind == "tx" else "autopush")
         self.events.extend(edge_events)
         self.event_cycles.extend([self.cycles + 1] * len(edge_events))
         return edge_events
@@ -233,13 +473,22 @@ class PEmBench:
     async def read(self, address):
         self.dut.i_csr_addr.value = address
         await Timer(1, unit="ns")
-        return int(self.dut.o_csr_dout.value)
+        value = int(self.dut.o_csr_dout.value)
+        if FUNCTIONAL_COVERAGE is not None:
+            FUNCTIONAL_COVERAGE.hit("csr_read", f"0x{address:X}")
+        return value
 
     async def expect(self, address, expected):
         actual = await self.read(address)
         assert actual == expected, (
             f"CSR 0x{address:X}: expected 0x{expected:04X}, got 0x{actual:04X}"
         )
+        if FUNCTIONAL_COVERAGE is not None:
+            if address == SM_STATUS:
+                FUNCTIONAL_COVERAGE.checked_status(actual)
+            elif address == SHIFT_COUNT:
+                FUNCTIONAL_COVERAGE.hit("shift_count", f"ISR:{actual & 15}")
+                FUNCTIONAL_COVERAGE.hit("shift_count", f"OSR:{(actual >> 4) & 15}")
 
     async def expect_bank(self, values):
         for address, expected in values.items():
@@ -264,7 +513,25 @@ class PEmBench:
             f"CSR write 0x{address:X}=0x{value:04X}: error={actual}, "
             f"expected {int(rejected)}"
         )
+        if FUNCTIONAL_COVERAGE is not None and not self.coverage_reset_seen:
+            FUNCTIONAL_COVERAGE.hit("csr_write", f'0x{address:X}:{"rejected" if actual else "accepted"}')
+            if not actual:
+                if address == SHIFT_CTRL:
+                    self.coverage_shift_ctrl = value & 15
+                elif address == PIN_CTRL:
+                    self.coverage_pin_ctrl = value & 0x3FF
+                elif address == SM_CTRL and not value & RESET:
+                    FUNCTIONAL_COVERAGE.hit("control", "CONT_RUN" if value & CONT_RUN else "STEP" if value & STEP else "HALT")
         await Timer(1, unit="ns")
+
+    def cover_start(self, word):
+        if FUNCTIONAL_COVERAGE is not None:
+            self.coverage_instruction = (word, self.coverage_shift_ctrl, self.coverage_pin_ctrl)
+
+    def cover_complete(self):
+        if FUNCTIONAL_COVERAGE is not None and self.coverage_instruction is not None:
+            FUNCTIONAL_COVERAGE.instruction(*self.coverage_instruction)
+            self.coverage_instruction = None
 
     async def wait_halted(self, limit=256):
         for elapsed in range(limit + 1):
@@ -276,11 +543,13 @@ class PEmBench:
 
     async def step(self, word=NOP, limit=256):
         self.program[await self.read(PC)] = word
+        self.cover_start(word)
         await self.write(SM_CTRL, STEP)
         await self.expect(SM_CTRL, STEP)
         assert (await self.read(SM_STATUS)) & RUNNING, "pending STEP is not running"
         elapsed = await self.wait_halted(limit)
         await self.expect(SM_CTRL, 0)
+        self.cover_complete()
         return elapsed
 
 
@@ -305,6 +574,7 @@ async def check_timed_instruction(bench, word, expected, delay):
     before = await bench.snapshot()
     sticky = (await bench.read(SM_STATUS)) & INVALID
     bench.program[before[PC]] = word
+    bench.cover_start(word)
     await bench.write(SM_CTRL, STEP)
     await bench.expect_state(before)
     await bench.tick()
@@ -318,9 +588,10 @@ async def check_timed_instruction(bench, word, expected, delay):
         await bench.tick()
         await bench.expect_state(expected)
         await bench.expect(SM_STATUS, (RUNNING if elapsed < 2 * delay else 0) | sticky)
+    bench.cover_complete()
 
 
-@cocotb.test()
+@core_test()
 async def test_reset_bank_and_idle_outputs(dut):
     b = await setup(dut)
     await b.expect_bank(RESET_VALUES)
@@ -338,7 +609,7 @@ async def test_reset_bank_and_idle_outputs(dut):
         await b.expect_bank(RESET_VALUES)
 
 
-@cocotb.test()
+@core_test()
 async def test_configuration_fields_and_reserved_bits(dut):
     b = await setup(dut)
     for address, value, expected in (
@@ -359,7 +630,7 @@ async def test_configuration_fields_and_reserved_bits(dut):
     await b.expect(SM_CTRL, 0)
 
 
-@cocotb.test()
+@core_test()
 async def test_writable_byte_state_and_atomic_rejection(dut):
     b = await setup(dut)
     for address in STATE_CSRS:
@@ -379,7 +650,7 @@ async def test_writable_byte_state_and_atomic_rejection(dut):
             assert int(dut.o_csr_error.value) == 0, "error must clear on a non-write edge"
 
 
-@cocotb.test()
+@core_test()
 async def test_read_only_csrs_and_shift_count_loads(dut):
     b = await setup(dut)
     for address, expected in ((PC, 0), (SHIFT_COUNT, 0x80)):
@@ -398,7 +669,7 @@ async def test_read_only_csrs_and_shift_count_loads(dut):
     await b.expect(SHIFT_COUNT, 0)
 
 
-@cocotb.test()
+@core_test()
 async def test_clkdiv_validation_and_clock_independent_csr_access(dut):
     b = await setup(dut)
     for value in (0x0010, 0x0011, 0x0018, 0x0020, 0xFFFF):
@@ -417,7 +688,7 @@ async def test_clkdiv_validation_and_clock_independent_csr_access(dut):
     await b.expect(CLKDIV, 0xFFFF)
 
 
-@cocotb.test()
+@core_test()
 async def test_pin_ctrl_range_validation_is_atomic(dut):
     b = await setup(dut)
     previous = 0
@@ -432,7 +703,7 @@ async def test_pin_ctrl_range_validation_is_atomic(dut):
             await b.expect(PIN_CTRL, previous)
 
 
-@cocotb.test()
+@core_test()
 async def test_soft_reset_retains_configuration_and_sticky_event(dut):
     b = await setup(dut)
     for external in (False, True):
@@ -459,7 +730,7 @@ async def test_soft_reset_retains_configuration_and_sticky_event(dut):
         await b.expect_bank(expected)
 
 
-@cocotb.test()
+@core_test()
 async def test_full_reset_wins_and_clears_dirty_bank(dut):
     b = await setup(dut)
     await seed_invalid(b)
@@ -478,7 +749,7 @@ async def test_full_reset_wins_and_clears_dirty_bank(dut):
     await b.expect_bank(RESET_VALUES)
 
 
-@cocotb.test()
+@core_test()
 async def test_csr_reads_have_no_side_effects(dut):
     b = await setup(dut)
     await seed_invalid(b)
@@ -491,7 +762,7 @@ async def test_csr_reads_have_no_side_effects(dut):
     await b.expect(SM_STATUS, INVALID)
 
 
-@cocotb.test()
+@core_test()
 async def test_nop_step_fetch_commit_and_full_delay(dut):
     b = await setup(dut)
     dut.i_tx_fifo_data.value = 0xA5
@@ -526,7 +797,7 @@ async def test_nop_step_fetch_commit_and_full_delay(dut):
         await b.expect(PC, 1)
 
 
-@cocotb.test()
+@core_test()
 async def test_nop_modulo_pc_and_configured_wrap(dut):
     b = await setup(dut)
     for expected in list(range(1, 32)) + [0]:
@@ -547,7 +818,7 @@ async def test_nop_modulo_pc_and_configured_wrap(dut):
             await b.expect(PC, expected)
 
 
-@cocotb.test()
+@core_test()
 async def test_continuous_nop_has_no_extra_fetch_cycle(dut):
     b = await setup(dut)
     for delay in (0, 1, 7):
@@ -566,7 +837,7 @@ async def test_continuous_nop_has_no_extra_fetch_cycle(dut):
         await b.wait_halted()
 
 
-@cocotb.test()
+@core_test()
 async def test_sideset_field_split_and_unselected_pin_retention(dut):
     b = await setup(dut)
     await b.write(Y, 0xA5)
@@ -598,7 +869,7 @@ async def test_sideset_field_split_and_unselected_pin_retention(dut):
                 assert int(dut.o_virt_outen.value) == 0xC3
 
 
-@cocotb.test()
+@core_test()
 async def test_all_reserved_mov_operands_commit_as_invalid_nop(dut):
     b = await setup(dut)
     await b.write(PIN_CTRL, (2 << 8) | 3)
@@ -627,7 +898,7 @@ async def test_all_reserved_mov_operands_commit_as_invalid_nop(dut):
     await b.expect(SM_STATUS, INVALID)  # Legal NOP must not clear the sticky event.
 
 
-@cocotb.test()
+@core_test()
 async def test_invalid_event_wins_w1c_and_live_status_is_read_only(dut):
     b = await setup(dut)
     await seed_invalid(b)
@@ -649,7 +920,7 @@ async def test_invalid_event_wins_w1c_and_live_status_is_read_only(dut):
     await b.wait_halted()
 
 
-@cocotb.test()
+@core_test()
 async def test_fresh_step_wins_simultaneous_consumption(dut):
     b = await setup(dut)
     await b.write(SM_CTRL, STEP)
@@ -669,7 +940,7 @@ async def test_fresh_step_wins_simultaneous_consumption(dut):
     await b.expect(PC, 2)
 
 
-@cocotb.test()
+@core_test()
 async def test_step_queued_during_delay_coalesces(dut):
     b = await setup(dut)
     b.program[0] = NOP | (3 << 8)
@@ -689,7 +960,7 @@ async def test_step_queued_during_delay_coalesces(dut):
     await b.expect(PC, 2)
 
 
-@cocotb.test()
+@core_test()
 async def test_cancel_and_continuous_to_step_block_old_request(dut):
     b = await setup(dut)
     await b.write(SM_CTRL, STEP)
@@ -712,7 +983,7 @@ async def test_cancel_and_continuous_to_step_block_old_request(dut):
     await b.expect(SM_STATUS, 0)
 
 
-@cocotb.test()
+@core_test()
 async def test_local_halt_and_global_freeze_drain_ready_work(dut):
     b = await setup(dut)
     for external in (False, True):
@@ -745,7 +1016,7 @@ async def test_local_halt_and_global_freeze_drain_ready_work(dut):
         await b.expect(PC, 2)
 
 
-@cocotb.test()
+@core_test()
 async def test_global_hold_preserves_and_coalesces_pending_commands(dut):
     b = await setup(dut)
     dut.i_halt_req.value = 1
@@ -778,7 +1049,7 @@ async def test_global_hold_preserves_and_coalesces_pending_commands(dut):
     await b.expect(SM_STATUS, 0)
 
 
-@cocotb.test()
+@core_test()
 async def test_configuration_rejected_for_pending_active_and_delay_work(dut):
     b = await setup(dut)
     b.program[0] = NOP | (31 << 8)
@@ -795,7 +1066,7 @@ async def test_configuration_rejected_for_pending_active_and_delay_work(dut):
         await b.expect(address, value)
 
 
-@cocotb.test()
+@core_test()
 async def test_frozen_blocked_work_blocks_configuration_until_reset(dut):
     b = await setup(dut)
     # Retained WAIT PIN must block configuration until explicitly aborted.
@@ -826,7 +1097,7 @@ async def test_frozen_blocked_work_blocks_configuration_until_reset(dut):
     await b.expect(PC, 1)
 
 
-@cocotb.test()
+@core_test()
 async def test_reset_aborts_fetch_commit_and_delay(dut):
     b = await setup(dut)
     for reset_kind in ("full", "local", "external"):
@@ -858,7 +1129,7 @@ async def test_reset_aborts_fetch_commit_and_delay(dut):
             await b.expect(PIN_OUT, 0)
 
 
-@cocotb.test()
+@core_test()
 async def test_programmed_divider_integer_and_fractional_execution_cadence(dut):
     b = await setup(dut)
     for divisor in (0x10, 0x11, 0x18, 0x1F, 0x20, 0x38, 0xFF):
@@ -891,7 +1162,7 @@ async def test_programmed_divider_integer_and_fractional_execution_cadence(dut):
         await b.wait_halted(limit)
 
 
-@cocotb.test()
+@core_test()
 async def test_set_x_y_all_immediates_preserve_other_state(dut):
     b = await setup(dut)
     for destination, address in ((1, X), (2, Y)):
@@ -904,7 +1175,7 @@ async def test_set_x_y_all_immediates_preserve_other_state(dut):
             await b.expect(SM_STATUS, 0)
 
 
-@cocotb.test()
+@core_test()
 async def test_set_pins_and_directions_all_bases_and_immediates(dut):
     b = await setup(dut)
     for base in range(8):
@@ -919,7 +1190,7 @@ async def test_set_pins_and_directions_all_bases_and_immediates(dut):
                 await b.expect(SM_STATUS, 0)
 
 
-@cocotb.test()
+@core_test()
 async def test_set_base_selectors_and_reset_through_pin_operations(dut):
     b = await setup(dut)
     dut.i_virt_in.value = 0x96
@@ -948,7 +1219,7 @@ async def test_set_base_selectors_and_reset_through_pin_operations(dut):
         await b.expect(PIN_OUT, 0x15)
 
 
-@cocotb.test()
+@core_test()
 async def test_all_reserved_set_operands_are_atomic_invalid_nops(dut):
     b = await setup(dut)
     dut.i_virt_in.value = 0x96
@@ -977,7 +1248,7 @@ async def test_all_reserved_set_operands_are_atomic_invalid_nops(dut):
             await b.expect(SM_STATUS, INVALID)
 
 
-@cocotb.test()
+@core_test()
 async def test_mov_all_legal_destinations_operations_and_sources(dut):
     b = await setup(dut)
     dut.i_virt_in.value = 0x96
@@ -1003,7 +1274,7 @@ async def test_mov_all_legal_destinations_operations_and_sources(dut):
                 await b.expect(SM_STATUS, 0)
 
 
-@cocotb.test()
+@core_test()
 async def test_mov_transforms_all_byte_values(dut):
     b = await setup(dut)
     for value in range(256):
@@ -1015,7 +1286,7 @@ async def test_mov_transforms_all_byte_values(dut):
             await b.expect(SM_STATUS, 0)
 
 
-@cocotb.test()
+@core_test()
 async def test_mov_pin_vectors_all_base_pairs_and_transforms(dut):
     b = await setup(dut)
     for in_base in range(8):
@@ -1034,7 +1305,7 @@ async def test_mov_pin_vectors_all_base_pairs_and_transforms(dut):
                     await b.expect(PIN_DIR, 0)
 
 
-@cocotb.test()
+@core_test()
 async def test_mov_shift_register_loads_and_osr_reads_do_not_autopull(dut):
     b = await setup(dut)
     dut.i_tx_fifo_data.value = 0xFF
@@ -1056,7 +1327,7 @@ async def test_mov_shift_register_loads_and_osr_reads_do_not_autopull(dut):
     await b.expect(SHIFT_COUNT, 0)
 
 
-@cocotb.test()
+@core_test()
 async def test_mov_pc_all_targets_override_wrap_and_mask_upper_bits(dut):
     b = await setup(dut)
     for target in range(32):
@@ -1069,7 +1340,7 @@ async def test_mov_pc_all_targets_override_wrap_and_mask_upper_bits(dut):
         assert int(dut.o_imem_addr.value) == target
 
 
-@cocotb.test()
+@core_test()
 async def test_mov_core_id_is_reset_independent(dut):
     b = await setup(dut)
     for reset_kind in ("full", "local", "external"):
@@ -1086,7 +1357,7 @@ async def test_mov_core_id_is_reset_independent(dut):
             await b.expect(Y, mov_transform(CORE_ID, operation))
 
 
-@cocotb.test()
+@core_test()
 async def test_jmp_conditions_all_targets_and_wrap_priority(dut):
     b = await setup(dut)
     await seed_state(b)
@@ -1114,7 +1385,7 @@ async def test_jmp_conditions_all_targets_and_wrap_priority(dut):
                 await b.expect(SM_STATUS, 0)
 
 
-@cocotb.test()
+@core_test()
 async def test_jmp_osre_uses_count_and_decoded_pull_threshold(dut):
     b = await setup(dut)
     await b.write(WRAP, (1 << 10) | 5)
@@ -1134,7 +1405,7 @@ async def test_jmp_osre_uses_count_and_decoded_pull_threshold(dut):
             await b.expect(OSR, 0)
 
 
-@cocotb.test()
+@core_test()
 async def test_jmp_pin_selects_jmp_vp_independently_of_in_base(dut):
     b = await setup(dut)
     for selected in range(8):
@@ -1147,7 +1418,7 @@ async def test_jmp_pin_selects_jmp_vp_independently_of_in_base(dut):
             await b.expect(PC, 13 if pin_high else (old_pc + 1) & 31)
 
 
-@cocotb.test()
+@core_test()
 async def test_mov_pins_and_jmp_pin_sample_at_commit(dut):
     b = await setup(dut)
     await b.step(set_word(5, 3))
@@ -1170,7 +1441,7 @@ async def test_mov_pins_and_jmp_pin_sample_at_commit(dut):
             await b.expect(SM_STATUS, 0)
 
 
-@cocotb.test()
+@core_test()
 async def test_new_instruction_commit_delay_and_sideset_priority(dut):
     b = await setup(dut)
     await b.step(set_word(7, 5))
@@ -1199,7 +1470,7 @@ async def test_new_instruction_commit_delay_and_sideset_priority(dut):
                 await check_timed_instruction(b, word, expected, delay)
 
 
-@cocotb.test()
+@core_test()
 async def test_reset_suppresses_new_instruction_commits_and_aborts_delay(dut):
     b = await setup(dut)
     words = (
@@ -1236,7 +1507,7 @@ async def test_reset_suppresses_new_instruction_commits_and_aborts_delay(dut):
                 await b.expect_state(expected)
 
 
-@cocotb.test()
+@core_test()
 async def test_continuous_set_jmp_decrement_loop_and_mov(dut):
     b = await setup(dut)
     b.program[:4] = [set_word(1, 3), jmp_word(2, 1), mov_word(2, 0, 1), NOP]
@@ -1255,7 +1526,7 @@ async def test_continuous_set_jmp_decrement_loop_and_mov(dut):
     await b.expect_bank(dict(zip((PC, X, Y), previous)))
 
 
-@cocotb.test()
+@core_test()
 async def test_rejected_csr_write_does_not_change_mov_source_or_commit(dut):
     b = await setup(dut)
     for destination, address in ((2, Y), (6, OSR)):
@@ -1272,7 +1543,7 @@ async def test_rejected_csr_write_does_not_change_mov_source_or_commit(dut):
         await b.expect(SM_STATUS, 0)
 
 
-@cocotb.test()
+@core_test()
 async def test_fractional_divider_jmp_decrements_once_and_drains_delay(dut):
     b = await setup(dut)
     await b.write(CLKDIV, 0x38)
@@ -1301,6 +1572,7 @@ async def test_fractional_divider_jmp_decrements_once_and_drains_delay(dut):
 async def begin_instruction(bench, word, command=STEP):
     before = await bench.snapshot()
     bench.program[before[PC]] = word
+    bench.cover_start(word)
     await bench.write(SM_CTRL, command)
     await bench.tick()
     await bench.expect_state(before)
@@ -1327,6 +1599,7 @@ async def check_delay(bench, expected, delay):
         await bench.expect_state(expected)
         await bench.expect(SM_STATUS, RUNNING if elapsed < 2 * delay else 0)
         assert len(bench.events) == events, "delay repeated an external request"
+    bench.cover_complete()
 
 
 async def load_osr_count(bench, count):
@@ -1352,7 +1625,7 @@ async def load_isr_count(bench, count):
     return expected
 
 
-@cocotb.test()
+@core_test()
 async def test_wait_pin_all_polarities_indices_and_input_bases(dut):
     b = await setup(dut)
     await b.write(PIN_CTRL, (2 << 8) | 6)
@@ -1376,7 +1649,7 @@ async def test_wait_pin_all_polarities_indices_and_input_bases(dut):
                 await b.expect(SM_STATUS, 0)
 
 
-@cocotb.test()
+@core_test()
 async def test_wait_irq_all_flags_relative_modes_and_polarities(dut):
     b = await setup(dut, allow_transfers=True)
     await b.write(PIN_CTRL, (2 << 8) | 6)
@@ -1404,7 +1677,7 @@ async def test_wait_irq_all_flags_relative_modes_and_polarities(dut):
                 assert b.events[start:] == ([('irq', (index, 0, 1))] if polarity else [])
 
 
-@cocotb.test()
+@core_test()
 async def test_remaining_reserved_operands_are_atomic_invalid_nops(dut):
     b = await setup(dut)
     dut.i_tx_fifo_valid.value = 1
@@ -1443,7 +1716,7 @@ async def test_remaining_reserved_operands_are_atomic_invalid_nops(dut):
     assert tested == 1056
 
 
-@cocotb.test()
+@core_test()
 async def test_out_all_destinations_counts_directions_and_pin_bases(dut):
     b = await setup(dut)
     for base in range(8):
@@ -1469,7 +1742,7 @@ async def test_out_all_destinations_counts_directions_and_pin_bases(dut):
                     await b.expect(SM_STATUS, 0)
 
 
-@cocotb.test()
+@core_test()
 async def test_in_all_sources_counts_directions_and_pin_bases(dut):
     b = await setup(dut)
     dut.i_virt_in.value = 0x96
@@ -1489,7 +1762,7 @@ async def test_in_all_sources_counts_directions_and_pin_bases(dut):
                     await b.expect(SM_STATUS, 0)
 
 
-@cocotb.test()
+@core_test()
 async def test_shift_datapaths_all_byte_values(dut):
     b = await setup(dut)
     for right in range(2):
@@ -1508,7 +1781,7 @@ async def test_shift_datapaths_all_byte_values(dut):
                 await b.expect(SHIFT_COUNT, (count << 4) | count)
 
 
-@cocotb.test()
+@core_test()
 async def test_shift_counts_saturate_and_all_load_clear_effects(dut):
     b = await setup(dut, allow_transfers=True)
     for right in range(2):
@@ -1538,7 +1811,7 @@ async def test_shift_counts_saturate_and_all_load_clear_effects(dut):
         await b.expect(SHIFT_COUNT, 0)
 
 
-@cocotb.test()
+@core_test()
 async def test_pull_condition_block_fallback_and_autopull_fence(dut):
     b = await setup(dut, allow_transfers=True)
     await b.write(X, 0x53)
@@ -1576,7 +1849,7 @@ async def test_pull_condition_block_fallback_and_autopull_fence(dut):
                             assert b.events[start:] == (expected_events if required else [])
 
 
-@cocotb.test()
+@core_test()
 async def test_push_condition_block_drop_and_full_byte_transfer(dut):
     b = await setup(dut, allow_transfers=True)
     for encoded_threshold in range(8):
@@ -1609,7 +1882,7 @@ async def test_push_condition_block_drop_and_full_byte_transfer(dut):
                         assert b.events[start:] == (expected_events if required else [])
 
 
-@cocotb.test()
+@core_test()
 async def test_autopull_all_threshold_count_and_shift_boundaries(dut):
     b = await setup(dut, allow_transfers=True)
     for encoded_threshold in range(8):
@@ -1635,7 +1908,7 @@ async def test_autopull_all_threshold_count_and_shift_boundaries(dut):
                     assert b.tx_queue == ([0xC3] if refill else [])
 
 
-@cocotb.test()
+@core_test()
 async def test_autopush_all_threshold_count_and_shift_boundaries(dut):
     b = await setup(dut, allow_transfers=True)
     for encoded_threshold in range(8):
@@ -1660,7 +1933,7 @@ async def test_autopush_all_threshold_count_and_shift_boundaries(dut):
                     assert b.events[start:] == ([('rx', value)] if push else [])
 
 
-@cocotb.test()
+@core_test()
 async def test_autopull_consumes_one_byte_before_shift_without_post_refill(dut):
     b = await setup(dut, allow_transfers=True)
     b.tx_queue = [0xAB, 0xCD]
@@ -1685,7 +1958,7 @@ async def test_autopull_consumes_one_byte_before_shift_without_post_refill(dut):
     assert b.tx_queue == [0x96]
 
 
-@cocotb.test()
+@core_test()
 async def test_autopush_stall_samples_pins_only_at_successful_commit(dut):
     b = await setup(dut, allow_transfers=True)
     for right in range(2):
@@ -1712,7 +1985,7 @@ async def test_autopush_stall_samples_pins_only_at_successful_commit(dut):
         assert b.events[start:] == [('rx', value)]
 
 
-@cocotb.test()
+@core_test()
 async def test_out_pc_overrides_wrap_for_all_targets_and_out_isr_count(dut):
     b = await setup(dut)
     for target in range(32):
@@ -1731,7 +2004,7 @@ async def test_out_pc_overrides_wrap_for_all_targets_and_out_isr_count(dut):
         await b.expect(SHIFT_COUNT, (count << 4) | count)
 
 
-@cocotb.test()
+@core_test()
 async def test_jmp_osre_all_architecturally_reachable_count_boundaries(dut):
     b = await setup(dut)
     for encoded_threshold in range(8):
@@ -1744,7 +2017,7 @@ async def test_jmp_osre_all_architecturally_reachable_count_boundaries(dut):
             await b.expect(PC, target if count < (encoded_threshold or 8) else (current + 1) & 31)
 
 
-@cocotb.test()
+@core_test()
 async def test_irq_set_clear_all_indices_relative_modes_and_clear_ignores_wait(dut):
     b = await setup(dut, allow_transfers=True)
     await b.write(PIN_CTRL, (2 << 8) | 6)
@@ -1763,7 +2036,7 @@ async def test_irq_set_clear_all_indices_relative_modes_and_clear_ignores_wait(d
                 assert b.flags == (initial & ~(1 << index)) | ((1 - clear) << index)
 
 
-@cocotb.test()
+@core_test()
 async def test_irq_set_wait_issues_once_and_commits_after_acknowledgement(dut):
     b = await setup(dut, allow_transfers=True)
     await b.write(PIN_CTRL, (2 << 8) | 6)
@@ -1786,7 +2059,7 @@ async def test_irq_set_wait_issues_once_and_commits_after_acknowledgement(dut):
             assert b.events[start:] == [('irq', (index, 1, 0))], "set-and-wait reissued its request"
 
 
-@cocotb.test()
+@core_test()
 async def test_irq_set_wait_dropped_set_completes_on_later_enable_tick(dut):
     b = await setup(dut, allow_transfers=True)
     for divisor in (0x10, 0x38):
@@ -1816,7 +2089,7 @@ async def test_irq_set_wait_dropped_set_completes_on_later_enable_tick(dut):
         assert b.events[start:] == [('irq', (5, 1, 0))]
 
 
-async def prepare_blocked_instruction(bench, family, command=STEP):
+async def prepare_blocked_instruction(bench, family, command=STEP, common=26):
     bench.tx_queue = []
     bench.flags = 0
     bench.dut.i_rx_fifo_ready.value = 0
@@ -1833,13 +2106,13 @@ async def prepare_blocked_instruction(bench, family, command=STEP):
     elif family == "in":
         await bench.write(SHIFT_CTRL, 8)
     words = {
-        "pin": wait_word(1, 1, 0, common=26),
-        "flag": wait_word(1, 2, 6 | 16, common=26),
-        "pull": push_pull_word(1, common=26),
-        "push": push_pull_word(0, common=26),
-        "out": out_word(0, 4, common=26),
-        "in": in_word(0, 8, common=26),
-        "irq": irq_word(6, wait=1, relative=1, common=26),
+        "pin": wait_word(1, 1, 0, common=common),
+        "flag": wait_word(1, 2, 6 | 16, common=common),
+        "pull": push_pull_word(1, common=common),
+        "push": push_pull_word(0, common=common),
+        "out": out_word(0, 4, common=common),
+        "in": in_word(0, 8, common=common),
+        "irq": irq_word(6, wait=1, relative=1, common=common),
     }
     before = await begin_instruction(bench, words[family], command)
     if family == "irq":
@@ -1875,13 +2148,16 @@ def blocked_completion(before, family):
     return expected, events
 
 
-@cocotb.test()
+@core_test()
 async def test_every_stall_family_freezes_and_resumes_retained_work(dut):
     b = await setup(dut, allow_transfers=True)
-    for external in (False, True):
+    # Both common fields drive the same side-set value; delay is zero or two.
+    for external, common in ((False, 24), (False, 26), (True, 24), (True, 26)):
         for family in ("pin", "flag", "pull", "push", "out", "in", "irq"):
             await b.reset()
-            before, cause = await prepare_blocked_instruction(b, family, CONT_RUN if external else STEP)
+            before, cause = await prepare_blocked_instruction(
+                b, family, CONT_RUN if external else STEP, common=common,
+            )
             await check_stall(b, before, cause)
             start = len(b.events)
             if external:
@@ -1906,17 +2182,17 @@ async def test_every_stall_family_freezes_and_resumes_retained_work(dut):
             expected, events = blocked_completion(before, family)
             if external:
                 await b.expect_state(expected)
-                for _ in range(4):
+                for _ in range(2 * (common & 7)):
                     await b.tick()
                     await b.expect_state(expected)
                 await b.write(SM_CTRL, 0)
                 await b.expect(SM_STATUS, 0)
             else:
-                await check_delay(b, expected, 2)
+                await check_delay(b, expected, common & 7)
             assert b.events[start:] == events
 
 
-@cocotb.test()
+@core_test()
 async def test_halt_before_irq_issue_suppresses_set_until_resume(dut):
     b = await setup(dut, allow_transfers=True)
     b.flags = 0
@@ -1950,7 +2226,7 @@ async def apply_core_reset(bench, kind):
         bench.dut.i_soft_reset.value = 0
 
 
-@cocotb.test()
+@core_test()
 async def test_reset_suppresses_all_same_edge_link_and_sync_effects(dut):
     b = await setup(dut, allow_transfers=True)
     for kind in ("full", "local", "external"):
@@ -1990,7 +2266,7 @@ async def test_reset_suppresses_all_same_edge_link_and_sync_effects(dut):
             assert b.tx_queue == pending_tx and b.flags == flags
 
 
-@cocotb.test()
+@core_test()
 async def test_reset_after_irq_issue_aborts_wait_without_undoing_flag_write(dut):
     b = await setup(dut, allow_transfers=True)
     for kind in ("full", "local", "external"):
@@ -2018,7 +2294,7 @@ async def test_reset_after_irq_issue_aborts_wait_without_undoing_flag_write(dut)
         await b.expect(SM_STATUS, 0)
 
 
-@cocotb.test()
+@core_test()
 async def test_nonblocking_and_conditional_noops_apply_all_common_fields_once(dut):
     b = await setup(dut, allow_transfers=True)
     await b.write(PIN_CTRL, (2 << 8) | 6)
@@ -2058,7 +2334,7 @@ async def test_nonblocking_and_conditional_noops_apply_all_common_fields_once(du
                 assert b.event_cycles[start] == before_cycle + 3  # Command edge, fetch, commit.
 
 
-@cocotb.test()
+@core_test()
 async def test_in_osr_source_never_autopulls_and_explicit_push_is_not_fenced(dut):
     b = await setup(dut, allow_transfers=True)
     await b.write(OSR, 0x96)
@@ -2081,7 +2357,7 @@ async def test_in_osr_source_never_autopulls_and_explicit_push_is_not_fenced(dut
     await b.expect(SHIFT_COUNT, 0x30)
 
 
-@cocotb.test()
+@core_test()
 async def test_step_queued_during_every_stall_waits_for_commit_and_full_delay(dut):
     b = await setup(dut, allow_transfers=True)
     for family in ("pin", "flag", "pull", "push", "out", "in", "irq"):
@@ -2115,7 +2391,7 @@ async def test_step_queued_during_every_stall_waits_for_commit_and_full_delay(du
         assert b.events[start:] == events
 
 
-@cocotb.test()
+@core_test()
 async def test_ready_link_work_drains_through_local_and_external_halt(dut):
     b = await setup(dut, allow_transfers=True)
     for external in (False, True):
@@ -2137,7 +2413,7 @@ async def test_ready_link_work_drains_through_local_and_external_halt(dut):
             assert b.events[start:] == events
 
 
-@cocotb.test()
+@core_test()
 async def test_fractional_divider_link_and_sync_requests_only_on_enabled_edges(dut):
     b = await setup(dut, allow_transfers=True)
     for family in ("pull", "push", "out", "in", "flag", "irq"):
@@ -2189,7 +2465,7 @@ async def test_fractional_divider_link_and_sync_requests_only_on_enabled_edges(d
         assert b.events[start:] == ([('irq', (effective_flag(6, 1), 1, 0))] if family == "irq" else events)
 
 
-@cocotb.test()
+@core_test()
 async def test_continuous_program_exercises_complete_isa_and_external_endpoints(dut):
     b = await setup(dut, allow_transfers=True)
     b.tx_queue = []
@@ -2297,7 +2573,8 @@ endmodule
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3 or sys.argv[1] != "--write-divider-model":
-        raise SystemExit("Usage: test_pem_core.py --write-divider-model OUTPUT.sv")
-    write_divider_model(sys.argv[2])
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--write-divider-model", type=Path, required=True)
+    args = parser.parse_args()
+    write_divider_model(args.write_divider_model)
 
