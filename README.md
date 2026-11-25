@@ -3,6 +3,7 @@
 # Tiny Tapeout Verilog Project Template
 
 - [Read the documentation for project](docs/info.md)
+- [L2: UART controller](src/L1-PEm-system/L2-uart-controller/L2_UART.md)
 
 ## What is Tiny Tapeout?
 
