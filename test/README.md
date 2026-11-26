@@ -60,6 +60,9 @@ This will generate `tb.vcd` instead of `tb.fst`.
 
 ## PEm core clock and waveforms
 
+For decoded instructions, execution phases, and individual virtual-pin traces
+in Surfer, see [PEm core waveform decoding](../docs/pem_core_waveforms.md).
+
 The PEm bench uses a free-running 10 ns clock with a 50% duty cycle. Memory,
 FIFO, and sync models run independently of the host test and monitor every
 rising edge. CSR writes start on falling edges, and asynchronous CSR reads

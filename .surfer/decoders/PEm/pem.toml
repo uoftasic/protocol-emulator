@@ -1,0 +1,217 @@
+# PEm v0.8. F is the raw delay/side-set field; see the runtime waveform probes.
+# The decoder keeps the last match, so NOP and reserved formats sort last.
+set = "PEm v0.8"
+width = 16
+
+[formats]
+names = ["jmp", "wait_pin", "wait_irq", "in", "out", "fifo", "mov", "irq", "set_instr", "zz_nop", "zzz_reserved"]
+parts = [
+    ["unused", 16, "u16"],
+    ["word", 16, "u16", "hex"],
+    ["common", 5, "u8", "hex"],
+    ["condition", 3, "JmpCondition"],
+    ["immediate", 5, "u8"],
+    ["polarity", 1, "u8"],
+    ["relative", 1, "Relative"],
+    ["flag", 3, "u8"],
+    ["in_source", 3, "InSource"],
+    ["out_dest", 3, "OutDest"],
+    ["count", 3, "BitCount"],
+    ["fifo_mode", 2, "FifoMode"],
+    ["blocking", 1, "Blocking"],
+    ["mov_dest", 3, "MovDest"],
+    ["operation", 2, "MovOperation"],
+    ["mov_source", 3, "MovSource"],
+    ["irq_mode", 2, "IrqMode"],
+    ["set_dest", 3, "SetDest"],
+]
+
+[mappings]
+names = ["JmpCondition", "Relative", "InSource", "OutDest", "BitCount", "FifoMode", "Blocking", "MovDest", "MovOperation", "MovSource", "IrqMode", "SetDest"]
+JmpCondition = ["ALWAYS", "!X", "X--", "!Y", "Y--", "X!=Y", "PIN", "!OSRE"]
+Relative = ["ABS", "REL"]
+InSource = ["PINS", "X", "Y", "NULL", "RESERVED", "RESERVED", "ISR", "OSR"]
+OutDest = ["PINS", "X", "Y", "NULL", "PINDIRS", "PC", "ISR", "RESERVED"]
+BitCount = ["8", "1", "2", "3", "4", "5", "6", "7"]
+FifoMode = ["PUSH", "PUSH IFFULL", "PULL", "PULL IFEMPTY"]
+Blocking = ["NOBLOCK", "BLOCK"]
+MovDest = ["PINS", "X", "Y", "RESERVED", "PC", "ISR", "OSR", "RESERVED"]
+MovOperation = ["", "~", "REVERSE ", "RESERVED "]
+MovSource = ["PINS", "X", "Y", "NULL", "CORE_ID", "RESERVED", "ISR", "OSR"]
+IrqMode = ["SET", "SET WAIT", "CLEAR", "CLEAR"]
+SetDest = ["PINS", "X", "Y", "RESERVED", "PINDIRS", "IN_BASE", "RESERVED", "OUT_BASE"]
+
+# Type slices consume instruction bits from MSB to LSB.
+[types]
+names = ["jmp", "wait_pin", "wait_irq", "in", "out", "fifo", "mov", "irq", "set", "raw"]
+jmp = [
+    { name = "unused", top = 2, bot = 0 },
+    { name = "common", top = 4, bot = 0 },
+    { name = "condition", top = 2, bot = 0 },
+    { name = "immediate", top = 4, bot = 0 },
+]
+wait_pin = [
+    { name = "unused", top = 2, bot = 0 },
+    { name = "common", top = 4, bot = 0 },
+    { name = "polarity", top = 0, bot = 0 },
+    { name = "unused", top = 1, bot = 0 },
+    { name = "immediate", top = 4, bot = 0 },
+]
+wait_irq = [
+    { name = "unused", top = 2, bot = 0 },
+    { name = "common", top = 4, bot = 0 },
+    { name = "polarity", top = 0, bot = 0 },
+    { name = "unused", top = 1, bot = 0 },
+    { name = "relative", top = 0, bot = 0 },
+    { name = "unused", top = 0, bot = 0 },
+    { name = "flag", top = 2, bot = 0 },
+]
+in = [
+    { name = "unused", top = 2, bot = 0 },
+    { name = "common", top = 4, bot = 0 },
+    { name = "in_source", top = 2, bot = 0 },
+    { name = "unused", top = 1, bot = 0 },
+    { name = "count", top = 2, bot = 0 },
+]
+out = [
+    { name = "unused", top = 2, bot = 0 },
+    { name = "common", top = 4, bot = 0 },
+    { name = "out_dest", top = 2, bot = 0 },
+    { name = "unused", top = 1, bot = 0 },
+    { name = "count", top = 2, bot = 0 },
+]
+fifo = [
+    { name = "unused", top = 2, bot = 0 },
+    { name = "common", top = 4, bot = 0 },
+    { name = "fifo_mode", top = 1, bot = 0 },
+    { name = "blocking", top = 0, bot = 0 },
+    { name = "unused", top = 4, bot = 0 },
+]
+mov = [
+    { name = "unused", top = 2, bot = 0 },
+    { name = "common", top = 4, bot = 0 },
+    { name = "mov_dest", top = 2, bot = 0 },
+    { name = "operation", top = 1, bot = 0 },
+    { name = "mov_source", top = 2, bot = 0 },
+]
+irq = [
+    { name = "unused", top = 2, bot = 0 },
+    { name = "common", top = 4, bot = 0 },
+    { name = "irq_mode", top = 1, bot = 0 },
+    { name = "relative", top = 0, bot = 0 },
+    { name = "unused", top = 1, bot = 0 },
+    { name = "flag", top = 2, bot = 0 },
+]
+set = [
+    { name = "unused", top = 2, bot = 0 },
+    { name = "common", top = 4, bot = 0 },
+    { name = "set_dest", top = 2, bot = 0 },
+    { name = "immediate", top = 4, bot = 0 },
+]
+raw = [{ name = "word", top = 15, bot = 0 }]
+
+[jmp]
+type = "jmp"
+[jmp.instructions]
+JMP = { mask = 0xe000, match = 0x0000 }
+[jmp.repr]
+default = "JMP %condition%, %immediate% [F=%common%]"
+
+[wait_pin]
+type = "wait_pin"
+[wait_pin.instructions]
+WAIT = { mask = 0xe060, match = 0x2020 }
+[wait_pin.repr]
+default = "WAIT %polarity% PIN %immediate% [F=%common%]"
+
+[wait_irq]
+type = "wait_irq"
+[wait_irq.instructions]
+WAIT = { mask = 0xe060, match = 0x2040 }
+[wait_irq.repr]
+default = "WAIT %polarity% IRQ %flag% %relative% [F=%common%]"
+
+[in]
+type = "in"
+[in.instructions]
+IN = { mask = 0xe000, match = 0x4000 }
+[in.repr]
+default = "IN %in_source%, %count% [F=%common%]"
+
+[out]
+type = "out"
+[out.instructions]
+OUT = { mask = 0xe000, match = 0x6000 }
+[out.repr]
+default = "OUT %out_dest%, %count% [F=%common%]"
+
+[fifo]
+type = "fifo"
+[fifo.instructions]
+FIFO = { mask = 0xe000, match = 0x8000 }
+[fifo.repr]
+default = "%fifo_mode% %blocking% [F=%common%]"
+
+[mov]
+type = "mov"
+[mov.instructions]
+MOV = { mask = 0xe000, match = 0xa000 }
+[mov.repr]
+default = "MOV %mov_dest%, %operation%%mov_source% [F=%common%]"
+
+[irq]
+type = "irq"
+[irq.instructions]
+IRQ = { mask = 0xe000, match = 0xc000 }
+[irq.repr]
+default = "IRQ %irq_mode% %flag% %relative% [F=%common%]"
+
+[set_instr]
+type = "set"
+[set_instr.instructions]
+SET = { mask = 0xe000, match = 0xe000 }
+[set_instr.repr]
+default = "SET %set_dest%, %immediate% [F=%common%]"
+
+[zz_nop]
+type = "mov"
+[zz_nop.instructions]
+NOP = { mask = 0xe0ff, match = 0xa042 }
+[zz_nop.repr]
+default = "NOP [F=%common%]"
+
+[zzz_reserved]
+type = "raw"
+[zzz_reserved.repr]
+default = "RESERVED -> NOP (%word%)"
+[zzz_reserved.instructions]
+wait_source_0 = { mask = 0xe060, match = 0x2000 }
+wait_source_3 = { mask = 0xe060, match = 0x2060 }
+wait_pin_bit4 = { mask = 0xe070, match = 0x2030 }
+wait_pin_bit3 = { mask = 0xe068, match = 0x2028 }
+wait_irq_bit3 = { mask = 0xe068, match = 0x2048 }
+in_source_4 = { mask = 0xe0e0, match = 0x4080 }
+in_source_5 = { mask = 0xe0e0, match = 0x40a0 }
+in_bit4 = { mask = 0xe010, match = 0x4010 }
+in_bit3 = { mask = 0xe008, match = 0x4008 }
+out_dest_7 = { mask = 0xe0e0, match = 0x60e0 }
+out_bit4 = { mask = 0xe010, match = 0x6010 }
+out_bit3 = { mask = 0xe008, match = 0x6008 }
+fifo_bit4 = { mask = 0xe010, match = 0x8010 }
+fifo_bit3 = { mask = 0xe008, match = 0x8008 }
+fifo_bit2 = { mask = 0xe004, match = 0x8004 }
+fifo_bit1 = { mask = 0xe002, match = 0x8002 }
+fifo_bit0 = { mask = 0xe001, match = 0x8001 }
+mov_dest_3 = { mask = 0xe0e0, match = 0xa060 }
+mov_dest_7 = { mask = 0xe0e0, match = 0xa0e0 }
+mov_op_3 = { mask = 0xe018, match = 0xa018 }
+mov_source_5 = { mask = 0xe007, match = 0xa005 }
+irq_bit4 = { mask = 0xe010, match = 0xc010 }
+irq_bit3 = { mask = 0xe008, match = 0xc008 }
+set_dest_3 = { mask = 0xe0e0, match = 0xe060 }
+set_dest_6 = { mask = 0xe0e0, match = 0xe0c0 }
+set_in_base_bit4 = { mask = 0xe0f0, match = 0xe0b0 }
+set_in_base_bit3 = { mask = 0xe0e8, match = 0xe0a8 }
+set_out_base_bit4 = { mask = 0xe0f0, match = 0xe0f0 }
+set_out_base_bit3 = { mask = 0xe0e8, match = 0xe0e8 }
+

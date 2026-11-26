@@ -1,0 +1,22 @@
+set = "PEm core phase"
+width = 3
+
+[formats]
+names = ["phase"]
+parts = [["phase", 3, "CorePhase"]]
+
+[mappings]
+names = ["CorePhase"]
+CorePhase = ["FETCH", "EXECUTE", "DELAY_1", "DELAY_2", "FROZEN", "RESERVED", "RESERVED", "RESERVED"]
+
+[types]
+names = ["phase"]
+phase = [{ name = "phase", top = 2, bot = 0 }]
+
+[phase]
+type = "phase"
+[phase.instructions]
+PHASE = { mask = 0, match = 0 }
+[phase.repr]
+default = "%phase%"
+

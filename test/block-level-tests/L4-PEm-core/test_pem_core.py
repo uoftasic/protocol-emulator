@@ -5,6 +5,7 @@ through public ports, including architectural register reads through CSR.
 Run `make` with the supplied divider, or `make test-model` to explicitly use
 the test-only Q12.4 divider while its owner's source is empty.
 Use `make coverage USE_DIVIDER_MODEL=1` for optional functional coverage.
+With Icarus, `WAVES=1` adds read-only debug aliases without changing test checks.
 """
 
 from collections import Counter
@@ -14,6 +15,7 @@ import argparse
 import html
 import json
 import os
+import re
 
 import cocotb
 from cocotb.clock import Clock
@@ -2881,9 +2883,141 @@ endmodule
     print("Using a TEST-ONLY divider model; supplied divider integration is unverified.")
 
 
+def wave_decoder_lines(table, source, target):
+    """Emit simulation text from the same TOML used by the desktop decoder."""
+    parts = {part[0]: part for part in table["formats"]["parts"]}
+    lines = []
+    for mapping in table["mappings"]["names"]:
+        values = table["mappings"][mapping]
+        bits = next(part[1] for part in parts.values() if part[2] == mapping)
+        text_bits = 8 * max(1, max(len(value) for value in values))
+        function = f"{target}_{mapping}"
+        lines.extend([
+            f"    function automatic [{text_bits - 1}:0] {function} (",
+            f"        input logic [{bits - 1}:0] value",
+            "    );",
+            "        case (value)",
+        ])
+        for value, text in enumerate(values):
+            lines.extend([
+                f"            {bits}'d{value}: begin",
+                f"                {function} = {json.dumps(text)};",
+                "            end",
+            ])
+        lines.extend([
+            "            default: begin",
+            f'                {function} = "?";',
+            "            end", "        endcase", "    endfunction", "",
+        ])
+
+    lines.extend([f"    always @({source}) begin", f'        {target} = "UNKNOWN";'])
+    for name in sorted(table["formats"]["names"]):
+        form = table[name]
+        fields = {}
+        top = table["width"] - 1
+        for field in table["types"][form["type"]]:
+            bottom = top - (field["top"] - field["bot"])
+            fields[field["name"]] = (
+                f"{source}[{top}]" if top == bottom else f"{source}[{top}:{bottom}]"
+            )
+            top = bottom - 1
+        for instruction, rule in sorted(form["instructions"].items()):
+            arguments = []
+
+            def placeholder(match):
+                part = parts[match[1]]
+                expression = fields[match[1]]
+                if part[2] in table["mappings"]["names"]:
+                    arguments.append(f"{target}_{part[2]}({expression})")
+                    return "%0s"
+                arguments.append(expression)
+                return "0x%0h" if len(part) == 4 and part[3] == "hex" else "%0d"
+
+            representation = form["repr"].get(instruction, form["repr"]["default"])
+            representation = re.sub(r"%([^%]+)%", placeholder, representation.replace("$name$", instruction))
+            width = table["width"]
+            lines.extend([
+                f"        if (({source} & {width}'h{rule['mask']:x}) == {width}'h{rule['match']:x}) begin",
+                f"            $sformat({target}, {json.dumps(representation)}, {', '.join(arguments)});",
+                "        end",
+            ])
+    lines.extend(["    end", ""])
+    return lines
+
+
+def write_wave_probes(destination):
+    """Generate read-only waveform probes, separate from black-box checks."""
+    import tomllib
+
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    signals = [
+        (1, "clk", "pem_core.clk"),
+        (1, "clk_en", "pem_core.clk_en"),
+        (16, "instruction", "pem_core.instruction"),
+        (5, "instruction_pc", "pem_core.instruction_pc"),
+        (1, "retained", "pem_core.retained_instruction"),
+        (3, "phase", "pem_core.state_q"),
+        (1, "fetch", "pem_core.fetch_accept"),
+        (1, "commit", "pem_core.instruction_commit"),
+        (1, "stalled", "pem_core.stalled"),
+        (1, "invalid", "pem_core.instruction_invalid"),
+        (5, "delay", "pem_core.instruction_delay"),
+        (5, "delay_remaining", "pem_core.delay_count"),
+        (2, "sideset_count", "pem_core.pin_ctrl[9:8]"),
+        (3, "sideset_base", "pem_core.pin_ctrl[2:0]"),
+        (2, "sideset_bits", "(pem_core.instruction[12:8] >> (5 - pem_core.pin_ctrl[9:8]))"),
+        (3, "in_base", "pem_core.in_base"),
+        (3, "out_base", "pem_core.out_base"),
+    ]
+    for lane in range(8):
+        signals.extend([
+            (1, f"vio{lane}_in", f"pem_core.i_virt_in[{lane}]"),
+            (1, f"vio{lane}_out", f"pem_core.o_virt_out[{lane}]"),
+            (1, f"vio{lane}_oe", f"pem_core.o_virt_outen[{lane}]"),
+        ])
+    signals.extend([
+        (1, "uart_tx", "pem_core.o_virt_out[0]"),
+        (1, "spi_mosi", "pem_core.o_virt_out[0]"),
+        (1, "spi_sclk", "pem_core.o_virt_out[1]"),
+        (1, "spi_cs_n", "pem_core.o_virt_out[2]"),
+        (1, "spi_miso", "pem_core.i_virt_in[7]"),
+    ])
+    lines = [
+        "// Simulation-only read-only aliases. UART/SPI names match the example programs.",
+        "`default_nettype none", "", "module pem_core_wave;",
+    ]
+    for width, name, expression in signals:
+        packed = f"[{width - 1}:0]" if width > 1 else ""
+        lines.append(f"    wire {packed:6} {name:16} = {expression};")
+    lines.extend([
+        "", "    logic [511:0] instruction_text;", "    logic [95:0] phase_text;", "",
+    ])
+    decoder_root = Path(__file__).resolve().parents[3] / ".surfer" / "decoders"
+    for file, source, target in [
+        ("PEm/pem.toml", "instruction", "instruction_text"),
+        ("PEm-Phase/phase.toml", "phase", "phase_text"),
+    ]:
+        table = tomllib.loads((decoder_root / file).read_text())
+        lines.extend(wave_decoder_lines(table, source, target))
+    lines.extend([
+        "", "    initial begin",
+        "        // Let cocotb select its dumpfile before adding this scope.",
+        "        #0;",
+        "        $dumpvars(0, pem_core_wave);",
+        "    end", "endmodule", "", "`default_nettype wire", "", "",
+    ])
+    destination.write_text("\n".join(lines))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--write-divider-model", type=Path, required=True)
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("--write-divider-model", type=Path)
+    action.add_argument("--write-wave-probes", type=Path)
     args = parser.parse_args()
-    write_divider_model(args.write_divider_model)
+    if args.write_divider_model:
+        write_divider_model(args.write_divider_model)
+    else:
+        write_wave_probes(args.write_wave_probes)
 

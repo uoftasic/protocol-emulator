@@ -1,0 +1,32 @@
+# Start with an empty signal panel and a WAVES=1 PEm core waveform.
+variable_add pem_core_wave.instruction
+item_focus a
+item_set_format PEm
+variable_add pem_core_wave.phase
+item_focus b
+item_set_format PEm-Phase
+variable_add pem_core_wave.clk
+variable_add pem_core_wave.clk_en
+variable_add pem_core_wave.instruction_pc
+variable_add pem_core_wave.fetch
+variable_add pem_core_wave.commit
+variable_add pem_core_wave.retained
+variable_add pem_core_wave.stalled
+variable_add pem_core_wave.invalid
+variable_add pem_core_wave.delay
+variable_add pem_core_wave.delay_remaining
+variable_add pem_core_wave.sideset_count
+variable_add pem_core_wave.sideset_bits
+variable_add pem_core_wave.vio0_out
+variable_add pem_core_wave.vio1_out
+variable_add pem_core_wave.vio2_out
+variable_add pem_core_wave.vio3_out
+variable_add pem_core_wave.vio4_out
+variable_add pem_core_wave.vio5_out
+variable_add pem_core_wave.vio6_out
+variable_add pem_core_wave.vio7_out
+variable_add pem_core.o_virt_outen
+variable_add pem_core.i_virt_in
+item_unfocus
+zoom_fit
+

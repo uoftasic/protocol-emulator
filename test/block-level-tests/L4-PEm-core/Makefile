@@ -45,6 +45,19 @@ COCOTB_TOPLEVEL = pem_core
 # Test modules, comma-separated, no .py
 COCOTB_TEST_MODULES = test_pem_core
 
+# Simulation-only aliases for instruction timing and individual virtual lanes.
+ifeq ($(SIM),icarus)
+ifeq ($(WAVES),1)
+WAVE_SOURCE = $(abspath $(SIM_BUILD))/pem_core_wave.sv
+WAVE_DECODERS = $(CURDIR)/../../../.surfer/decoders/PEm/pem.toml \
+                $(CURDIR)/../../../.surfer/decoders/PEm-Phase/phase.toml
+VERILOG_SOURCES += $(WAVE_SOURCE)
+COMPILE_ARGS += -s pem_core_wave
+$(WAVE_SOURCE): test_pem_core.py $(WAVE_DECODERS)
+	$(PYTHON) test_pem_core.py --write-wave-probes $@
+endif
+endif
+
 .PHONY: lint synth test-model coverage
 lint:
 	VERILATOR="$(VERILATOR)" $(PYTHON) lint_pem_core.py
