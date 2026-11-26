@@ -114,6 +114,7 @@ module pem_core #(
     logic        pin_ctrl_valid;
     logic        clkdiv_write_accepted;
     logic        divider_reset;
+    logic        divider_enable;
     logic        divider_clk_en;
     logic        clk_en;
 
@@ -199,13 +200,16 @@ module pem_core #(
 
     assign clkdiv_write_accepted = csr_write_accepted && i_csr_addr == CSR_CLKDIV;
     assign divider_reset = rst || core_reset || clkdiv_write_accepted;
-    assign clk_en = divider_clk_en && !divider_reset;
+    assign divider_enable = !divider_reset &&
+                            ((state_q != STATE_FETCH && state_q != STATE_FROZEN) || start_allowed);
+    assign clk_en = divider_clk_en && divider_enable;
 
     clock_divider u_clock_divider (
-        .clk     (clk),
-        .rst     (divider_reset),
-        .divisor (clkdiv),
-        .clk_en  (divider_clk_en)
+        .clk      (clk),
+        .rst      (divider_reset),
+        .i_enable (divider_enable),
+        .divisor  (clkdiv),
+        .clk_en   (divider_clk_en)
     );
 
     // -------------------- CSR access and control --------------------

@@ -35,8 +35,9 @@ Outputs are in ignored `test/block-level-tests/L4-PEm-core/sim_build/synth_0/`
 | `synth.ys`, `synth.log`, `manifest.json` | Exact Yosys commands, full log, source hash, CORE_ID, divider mode, tool version, and result summary. |
 
 The empty divider source is represented by a black box with the approved
-`clk`, `rst`, `divisor[15:0]`, and `clk_en` ports. Its output remains an unknown
-external source during synthesis, preserving the execution logic. When the
+`clk`, `rst`, `i_enable`, `divisor[15:0]`, and `clk_en` ports. The core drives
+`i_enable` while execution is active or a STEP/run start is allowed. The divider
+output remains an unknown external source during synthesis, preserving the execution logic. When the
 owner supplies a nonempty divider, the script reads that module automatically.
 
 Yosys can skip automatic FSM extraction when recoding offers no benefit. The

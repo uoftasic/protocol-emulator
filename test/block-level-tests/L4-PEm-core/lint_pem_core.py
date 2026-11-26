@@ -35,6 +35,7 @@ def main():
                 "module clock_divider (\n"
                 "    input  logic        clk,\n"
                 "    input  logic        rst,\n"
+                "    input  logic        i_enable,\n"
                 "    input  logic [15:0] divisor,\n"
                 "    output logic        clk_en\n"
                 ");\n"

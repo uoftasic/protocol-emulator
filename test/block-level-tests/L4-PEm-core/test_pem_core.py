@@ -16,7 +16,9 @@ import json
 import os
 
 import cocotb
-from cocotb.triggers import Timer
+from cocotb.clock import Clock
+from cocotb.triggers import Event, FallingEdge, ReadOnly, RisingEdge, Timer
+from cocotb.utils import get_sim_time
 
 
 SM_CTRL, SM_STATUS, PC, WRAP, SHIFT_CTRL, SHIFT_THRESH, CLKDIV = range(7)
@@ -32,6 +34,8 @@ INVALID = 0x0008
 NOP = 0xA042  # MOV Y,Y, copy, zero common field.
 WAIT_HIGH_PIN0 = 0x20A0
 CORE_ID = int(os.environ.get("CORE_ID", "0"))
+CLOCK_PERIOD_NS = 10
+SETTLE_PS = 1
 
 RESET_VALUES = {addr: 0 for addr in range(16)}
 RESET_VALUES.update({CLKDIV: 0x0010, SHIFT_COUNT: 0x0080})
@@ -354,6 +358,7 @@ class PEmBench:
         self.dut = dut
         self.program = [NOP] * 32
         self.cycles = 0
+        self.last_rising_ps = 0
         self.allow_transfers = allow_transfers
         self.events = []
         self.event_cycles = []
@@ -364,38 +369,51 @@ class PEmBench:
         self.coverage_shift_ctrl = 0
         self.coverage_pin_ctrl = 0
         self.coverage_reset_seen = False
+        self.cycle_done = Event()
         for name in (
             "clk", "rst", "i_soft_reset", "i_halt_req", "i_csr_addr",
             "i_csr_din", "i_csr_wren", "i_imem_din", "i_tx_fifo_data",
             "i_tx_fifo_valid", "i_rx_fifo_ready", "i_virt_in", "i_irq_din",
         ):
             getattr(dut, name).value = 0
+        self.clock = Clock(dut.clk, CLOCK_PERIOD_NS, unit="ns")
+        self.clock.start(start_high=False)
+        self.environment_task = cocotb.start_soon(self.run_environment())
 
     async def tick(self, count=1):
-        # Drive before the rising edge; sample after HDL has settled.
-        for _ in range(count):
-            await Timer(1, unit="ns")
-            self.drive_endpoints()
-            address = 0 if int(self.dut.rst.value) else int(self.dut.o_imem_addr.value)
-            self.dut.i_imem_din.value = self.program[address]
-            await Timer(4, unit="ns")
+        target = self.cycles + count
+        while self.cycles < target:
+            self.cycle_done.clear()
+            await self.cycle_done.wait()
+
+    async def run_environment(self):
+        while True:
+            await Timer(SETTLE_PS, unit="ps")
+            self.drive_environment()
+            await RisingEdge(self.dut.clk)
+            self.last_rising_ps = int(get_sim_time(unit="ps"))
             if not self.allow_transfers:
                 self.assert_no_transfers()
             edge_events = self.capture_transfers()
-            self.dut.clk.value = 1
-            await Timer(5, unit="ns")
+            await Timer(SETTLE_PS, unit="ps")
             for kind, value in edge_events:
                 if kind == "tx" and self.tx_queue is not None:
                     assert self.tx_queue.pop(0) == value
                 if kind == "irq" and self.flags is not None and self.apply_irq_writes:
                     index, level, _ = value
                     self.flags = (self.flags & ~(1 << index)) | (level << index)
-            self.dut.clk.value = 0
-            await Timer(1, unit="ns")
             self.cycles += 1
-            self.drive_endpoints()
+            self.drive_environment()
+            await Timer(SETTLE_PS, unit="ps")
             if not self.allow_transfers:
                 self.assert_no_transfers()
+            self.cycle_done.set()
+            await FallingEdge(self.dut.clk)
+
+    def drive_environment(self):
+        self.drive_endpoints()
+        address = 0 if int(self.dut.rst.value) else int(self.dut.o_imem_addr.value)
+        self.dut.i_imem_din.value = self.program[address]
 
     def drive_endpoints(self):
         if self.tx_queue is not None:
@@ -472,7 +490,7 @@ class PEmBench:
 
     async def read(self, address):
         self.dut.i_csr_addr.value = address
-        await Timer(1, unit="ns")
+        await Timer(SETTLE_PS, unit="ps")
         value = int(self.dut.o_csr_dout.value)
         if FUNCTIONAL_COVERAGE is not None:
             FUNCTIONAL_COVERAGE.hit("csr_read", f"0x{address:X}")
@@ -503,6 +521,7 @@ class PEmBench:
         assert int(self.dut.o_virt_outen.value) == expected[PIN_DIR]
 
     async def write(self, address, value, rejected=False):
+        await FallingEdge(self.dut.clk)
         self.dut.i_csr_addr.value = address
         self.dut.i_csr_din.value = value
         self.dut.i_csr_wren.value = 1
@@ -522,7 +541,7 @@ class PEmBench:
                     self.coverage_pin_ctrl = value & 0x3FF
                 elif address == SM_CTRL and not value & RESET:
                     FUNCTIONAL_COVERAGE.hit("control", "CONT_RUN" if value & CONT_RUN else "STEP" if value & STEP else "HALT")
-        await Timer(1, unit="ns")
+        await Timer(SETTLE_PS, unit="ps")
 
     def cover_start(self, word):
         if FUNCTIONAL_COVERAGE is not None:
@@ -557,6 +576,20 @@ async def setup(dut, allow_transfers=False):
     bench = PEmBench(dut, allow_transfers=allow_transfers)
     await bench.reset()
     return bench
+
+
+async def record_pin_transitions(dut, transitions):
+    while True:
+        await dut.o_virt_out.value_change
+        await ReadOnly()
+        transitions.append((int(get_sim_time(unit="ps")), int(dut.o_virt_out.value)))
+
+
+async def wait_until_ps(deadline):
+    remaining = deadline - int(get_sim_time(unit="ps"))
+    assert remaining >= 0, f"missed pin observation deadline by {-remaining} ps"
+    if remaining:
+        await Timer(remaining, unit="ps")
 
 
 async def seed_invalid(bench):
@@ -1160,6 +1193,203 @@ async def test_programmed_divider_integer_and_fractional_execution_cadence(dut):
         assert commits[-1] - commits[0] == 2 * divisor, (divisor, gaps)
         await b.write(SM_CTRL, 0)
         await b.wait_halted(limit)
+
+
+@core_test()
+async def test_integer_dividers_exact_pin_cadence_without_drift(dut):
+    b = await setup(dut)
+    period_ps = CLOCK_PERIOD_NS * 1000
+    for divisor in (*range(1, 10), 16, 31):
+        await b.reset()
+        b.program[:2] = [set_word(0, 1), set_word(0, 0)]
+        await b.write(WRAP, (1 << 10) | (1 << 5))
+        await b.write(PIN_DIR, 1)
+        await b.write(CLKDIV, divisor << 4)
+        transitions = []
+        monitor = cocotb.start_soon(record_pin_transitions(dut, transitions))
+        try:
+            await b.write(SM_CTRL, CONT_RUN)
+            start_ps = b.last_rising_ps
+            interval_ps = 2 * divisor * period_ps
+            await wait_until_ps(start_ps + 64 * interval_ps + 2 * SETTLE_PS)
+            expected = [
+                (start_ps + (index + 1) * interval_ps, 1 - index % 2)
+                for index in range(64)
+            ]
+            assert transitions == expected, (divisor, transitions, expected)
+            await b.expect_bank({PC: 0, PIN_OUT: 0, SM_STATUS: RUNNING})
+        finally:
+            monitor.cancel()
+        await b.write(SM_CTRL, RESET)
+
+
+@core_test()
+async def test_integer_divider_boundaries_and_idle_step_latency(dut):
+    b = await setup(dut)
+    period_ps = CLOCK_PERIOD_NS * 1000
+    for divisor in (*range(1, 10), 15, 16, 17, 255, 256, 4095):
+        await b.reset()
+        b.program[:2] = [set_word(0, 1), set_word(0, 0)]
+        await b.write(CLKDIV, divisor << 4)
+        transitions = []
+        monitor = cocotb.start_soon(record_pin_transitions(dut, transitions))
+        try:
+            for index in range(2):
+                await b.write(SM_CTRL, STEP)
+                start_ps = b.last_rising_ps
+                await b.tick(divisor - 1)
+                await b.expect_bank({SM_CTRL: STEP, PC: index, PIN_OUT: index, SM_STATUS: RUNNING})
+                await b.tick()
+                await b.expect_bank({SM_CTRL: 0, PC: index, PIN_OUT: index, SM_STATUS: RUNNING})
+                await b.tick(divisor - 1)
+                await b.expect_bank({PC: index, PIN_OUT: index, SM_STATUS: RUNNING})
+                assert len(transitions) == index, "STEP committed before its second enable"
+                await b.tick()
+                await b.expect_bank({PC: index + 1, PIN_OUT: 1 - index, SM_STATUS: 0})
+                assert transitions[-1] == (start_ps + 2 * divisor * period_ps, 1 - index)
+                if index == 0:
+                    await b.tick(divisor + 7)
+                    assert len(transitions) == 1, "idle divider caused a pin transition"
+        finally:
+            monitor.cancel()
+
+
+@core_test()
+async def test_integer_dividers_delay_and_sideset_pin_timing(dut):
+    b = await setup(dut)
+    period_ps = CLOCK_PERIOD_NS * 1000
+    for divisor in (2, 3, 5, 9):
+        for sideset_count in range(3):
+            await b.reset()
+            delay_width = 5 - sideset_count
+            delays = (0, 1, (1 << delay_width) - 1, 2)
+            side_high = (1 << sideset_count) - 1
+            b.program[:4] = [
+                set_word(0, 1 - index % 2,
+                         common=delays[index] | ((side_high if index % 2 else 0) << delay_width))
+                for index in range(4)
+            ]
+            await b.write(WRAP, (1 << 10) | (3 << 5))
+            await b.write(PIN_CTRL, (sideset_count << 8) | 1)
+            await b.write(PIN_DIR, (1 << (sideset_count + 1)) - 1)
+            await b.write(CLKDIV, divisor << 4)
+            transitions = []
+            monitor = cocotb.start_soon(record_pin_transitions(dut, transitions))
+            try:
+                await b.write(SM_CTRL, CONT_RUN)
+                start_ps = b.last_rising_ps
+                elapsed_enables = 0
+                expected = []
+                for index in range(16):
+                    elapsed_enables += 2
+                    pins = 1 if index % 2 == 0 else side_high << 1
+                    expected.append((start_ps + elapsed_enables * divisor * period_ps, pins))
+                    elapsed_enables += 2 * delays[index % 4]
+                await wait_until_ps(start_ps + elapsed_enables * divisor * period_ps + 2 * SETTLE_PS)
+                assert transitions == expected, (divisor, sideset_count, transitions, expected)
+                await b.expect_bank({PC: 0, PIN_OUT: side_high << 1, SM_STATUS: RUNNING})
+            finally:
+                monitor.cancel()
+            await b.write(SM_CTRL, RESET)
+
+
+@core_test()
+async def test_integer_divider_uart_frame_has_exact_bit_widths(dut):
+    b = await setup(dut)
+    period_ps = CLOCK_PERIOD_NS * 1000
+    for divisor in (3, 5, 9):
+        for data in (0x55, 0xA6):
+            await b.reset()
+            bits = [0] + [(data >> index) & 1 for index in range(8)] + [1]
+            b.program[:11] = [
+                set_word(0, 0, common=3),
+                *[out_word(0, 1, common=3) for _ in range(8)],
+                set_word(0, 1, common=3),
+                WAIT_HIGH_PIN0,
+            ]
+            await b.write(SHIFT_CTRL, 1)
+            await b.write(OSR, data)
+            await b.write(PIN_DIR, 1)
+            await b.write(PIN_OUT, 1)
+            await b.write(CLKDIV, divisor << 4)
+            transitions = []
+            monitor = cocotb.start_soon(record_pin_transitions(dut, transitions))
+            try:
+                await b.write(SM_CTRL, CONT_RUN)
+                start_ps = b.last_rising_ps + 2 * divisor * period_ps
+                bit_ps = 8 * divisor * period_ps
+                previous = 1
+                expected = []
+                for index, bit in enumerate(bits):
+                    if bit != previous:
+                        expected.append((start_ps + index * bit_ps, bit))
+                    previous = bit
+                    await wait_until_ps(start_ps + index * bit_ps + bit_ps // 2)
+                    assert int(dut.o_virt_out.value) == bit, (divisor, data, index)
+                await wait_until_ps(start_ps + 10 * bit_ps + 2 * divisor * period_ps + 2 * SETTLE_PS)
+                assert transitions == expected, (divisor, data, transitions, expected)
+                await b.expect_bank({
+                    PC: 10, PIN_OUT: 1, OSR: 0, SHIFT_COUNT: 0x80,
+                    SM_STATUS: blocked_status(1),
+                })
+            finally:
+                monitor.cancel()
+            await b.write(SM_CTRL, RESET)
+
+
+@core_test()
+async def test_integer_divider_spi_clock_data_and_sample_timing(dut):
+    b = await setup(dut)
+    period_ps = CLOCK_PERIOD_NS * 1000
+    for divisor in (3, 5, 9):
+        for tx_data, rx_data in ((0xA5, 0x3C), (0x3C, 0xA6)):
+            await b.reset()
+            # VIO0=MOSI, VIO1=SCLK, VIO2=CS_N, VIO7=MISO; mode 0.
+            b.program[:20] = [
+                set_word(5, 7), set_word(0, 0, common=3),
+                *[word for _ in range(8) for word in (
+                    out_word(0, 1, common=3), in_word(0, 1, common=16 | 3),
+                )],
+                set_word(0, 4, common=3), wait_word(1, 1, 6),
+            ]
+            dut.i_virt_in.value = 0
+            await b.write(PIN_CTRL, (1 << 8) | 1)
+            await b.write(OSR, tx_data)
+            await b.write(PIN_DIR, 7)
+            await b.write(PIN_OUT, 4)
+            await b.write(CLKDIV, divisor << 4)
+            transitions = []
+            monitor = cocotb.start_soon(record_pin_transitions(dut, transitions))
+            try:
+                await b.write(SM_CTRL, CONT_RUN)
+                start_ps = b.last_rising_ps
+                half_bit_ps = 8 * divisor * period_ps
+                select_ps = start_ps + 4 * divisor * period_ps
+                expected = [(select_ps, 0)]
+                previous = 0
+                for index in range(8):
+                    low_ps = select_ps + (2 * index + 1) * half_bit_ps
+                    high_ps = low_ps + half_bit_ps
+                    mosi = (tx_data >> (7 - index)) & 1
+                    if mosi != previous:
+                        expected.append((low_ps, mosi))
+                    expected.append((high_ps, mosi | 2))
+                    previous = mosi | 2
+                    await wait_until_ps(low_ps + SETTLE_PS)
+                    assert int(dut.o_virt_out.value) == mosi, (divisor, tx_data, index, "setup")
+                    dut.i_virt_in.value = ((rx_data >> (7 - index)) & 1) << 7
+                    await wait_until_ps(high_ps + SETTLE_PS)
+                    assert int(dut.o_virt_out.value) == mosi | 2, (divisor, tx_data, index, "sample")
+                expected.append((select_ps + 17 * half_bit_ps, 4))
+                await wait_until_ps(start_ps + 150 * divisor * period_ps + 2 * SETTLE_PS)
+                assert transitions == expected, (divisor, tx_data, transitions, expected)
+                await b.expect_bank({
+                    PC: 19, PIN_OUT: 4, PIN_DIR: 7, ISR: rx_data, OSR: 0,
+                    SHIFT_COUNT: 0x88, SM_STATUS: blocked_status(1),
+                })
+            finally:
+                monitor.cancel()
+            await b.write(SM_CTRL, RESET)
 
 
 @core_test()
@@ -2532,6 +2762,82 @@ async def test_continuous_program_exercises_complete_isa_and_external_endpoints(
                         ('irq', (3, 0, 1)), ('irq', (index, 1, 0))]
 
 
+@core_test()
+async def test_free_running_clock_advances_during_csr_reads_and_host_waits(dut):
+    b = await setup(dut)
+    await b.write(SM_CTRL, CONT_RUN)
+    start_cycles = b.cycles
+    start_time = int(get_sim_time(unit="ps"))
+    edge_times = []
+
+    async def observe_clock():
+        for _ in range(10):
+            await FallingEdge(dut.clk)
+            edge_times.append(int(get_sim_time(unit="ps")))
+            await RisingEdge(dut.clk)
+            edge_times.append(int(get_sim_time(unit="ps")))
+
+    observer = cocotb.start_soon(observe_clock())
+    for _ in range(20):
+        await b.read(PC)
+        await Timer(1, unit="ns")
+    assert b.cycles - start_cycles == 2, "CSR polling stopped the clock"
+    remaining = 10 * CLOCK_PERIOD_NS * 1000 - (int(get_sim_time(unit="ps")) - start_time)
+    await Timer(remaining, unit="ps")
+    await observer
+    assert b.cycles - start_cycles == 10, "host wait stopped the clock"
+    assert len(edge_times) == 20
+    assert all(right - left == CLOCK_PERIOD_NS * 500
+               for left, right in zip(edge_times, edge_times[1:])), edge_times
+    await b.expect(PC, 5)
+    # A request arriving in the low phase waits for the next falling edge.
+    # The intervening fetch must drain when the halt write is accepted.
+    await Timer(7, unit="ns")
+    await b.write(SM_CTRL, 0)
+    halted_cycles = b.cycles
+    await Timer(3 * CLOCK_PERIOD_NS, unit="ns")
+    assert b.cycles - halted_cycles == 3, "halt stopped the system clock"
+    await b.expect_bank({PC: 6, SM_STATUS: 0})
+
+
+@core_test()
+async def test_continuous_full_isa_sanity_during_host_wait(dut):
+    b = await setup(dut, allow_transfers=True)
+    data = [(0x21 + 7 * index) & 0xFF for index in range(32)]
+    b.tx_queue = list(data)
+    b.flags = 0
+    dut.i_virt_in.value = 0x3C
+    dut.i_rx_fifo_ready.value = 1
+    b.program[:10] = [
+        push_pull_word(1), out_word(0, 8), in_word(0, 8), push_pull_word(0),
+        irq_word(3), wait_word(1, 2, 3), mov_word(2, 0, 4),
+        set_word(1, 3), jmp_word(2, 8), jmp_word(0, 0),
+    ]
+    await b.write(CLKDIV, 0x18)
+    await b.write(SM_CTRL, CONT_RUN)
+    start_cycles = b.cycles
+    # Each loop has 26 execution enables: four JMP X-- attempts plus the
+    # other nine instructions. Divide-by-1.5 takes 39 system clocks.
+    await Timer(len(data) * 39 * CLOCK_PERIOD_NS, unit="ns")
+    assert b.cycles - start_cycles == len(data) * 39
+    expected_events = []
+    for value in data:
+        expected_events.extend([
+            ('tx', value), ('rx', 0x3C), ('irq', (3, 1, 0)), ('irq', (3, 0, 1)),
+        ])
+    assert b.events == expected_events
+    assert b.tx_queue == []
+    assert b.flags == 0
+    await b.expect_bank({
+        PC: 0, X: 0xFF, Y: CORE_ID, ISR: 0, OSR: 0,
+        SHIFT_COUNT: 0x80, PIN_OUT: data[-1], SM_STATUS: RUNNING,
+    })
+    await b.write(SM_CTRL, 0)
+    await Timer(10 * CLOCK_PERIOD_NS, unit="ns")
+    await b.expect_bank({PC: 0, PIN_OUT: data[-1], SM_STATUS: 0})
+    assert b.events == expected_events
+
+
 def write_divider_model(destination):
     """Generate an explicit simulation dependency; never edit the owner's RTL."""
     destination = Path(destination)
@@ -2543,6 +2849,7 @@ def write_divider_model(destination):
 module clock_divider (
     input  logic        clk,
     input  logic        rst,
+    input  logic        i_enable,
     input  logic [15:0] divisor,
     output logic        clk_en
 );
@@ -2552,15 +2859,17 @@ module clock_divider (
 
     assign sum = {1'b0, phase} + 17'h00010;
     assign remainder = sum - {1'b0, divisor};
-    assign clk_en = !rst && sum >= {1'b0, divisor};
+    assign clk_en = !rst && i_enable && sum >= {1'b0, divisor};
 
     always_ff @(posedge clk) begin
         if (rst) begin
             phase <= 16'd0;
-        end else if (clk_en) begin
-            phase <= remainder[15:0];
-        end else begin
-            phase <= sum[15:0];
+        end else if (i_enable) begin
+            if (clk_en) begin
+                phase <= remainder[15:0];
+            end else begin
+                phase <= sum[15:0];
+            end
         end
     end
 endmodule

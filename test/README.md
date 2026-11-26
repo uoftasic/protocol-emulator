@@ -26,6 +26,11 @@ The owner's `clock_divider.sv` is currently empty. Once its implementation is
 available, omit this option to test the actual divider. Core ID defaults to zero;
 use `CORE_ID=0`, `1`, `2`, or `3` to select a separately compiled core instance.
 
+The core controls the divider's `i_enable`: it runs for active instructions,
+stalls, delays, and allowed STEP/run starts, and pauses while idle or frozen.
+The model holds phase and suppresses `clk_en` while disabled; reset clears
+phase regardless of enable. Resume preserves phase.
+
 For block tests only:
 
 ```sh
@@ -52,6 +57,80 @@ make -C test -B FST= USE_DIVIDER_MODEL=1
 ```
 
 This will generate `tb.vcd` instead of `tb.fst`.
+
+## PEm core clock and waveforms
+
+The PEm bench uses a free-running 10 ns clock with a 50% duty cycle. Memory,
+FIFO, and sync models run independently of the host test and monitor every
+rising edge. CSR writes start on falling edges, and asynchronous CSR reads
+settle for 1 ps. `tick()` waits for completed clock edges; it does not generate
+or pause the clock. Reset and halt leave the system clock running.
+
+The clock regression checks uniform half-periods during CSR polling, host
+waits, and halt. A continuous sanity test runs all eight opcode families in
+a 32-iteration loop with a Q12.4 divisor of 1.5, while the host waits without
+calling `tick()`. It checks every TX/RX/sync event and final architectural
+state through public ports and CSR readback. Its waveform is about 12.6 us.
+
+On November 26, 2026, all 78 tests passed for each CORE_ID 0-3, including the
+integer timing checks below: 312 core passes and 186/186 selected functional
+bins per ID. The shared CI coverage entry point passed 89 tests with one
+expected UART parity skip.
+These results use the test-only divider model.
+
+Generate waves for that one test from the repository root:
+
+```sh
+make -B -C test/block-level-tests/L4-PEm-core sim \
+    USE_DIVIDER_MODEL=1 WAVES=1 \
+    COCOTB_TEST_FILTER=test_continuous_full_isa_sanity_during_host_wait \
+    COCOTB_RESULTS_FILE=sim_build/divider_model_0/sanity-results.xml
+```
+
+The core waveform is
+`test/block-level-tests/L4-PEm-core/sim_build/divider_model_0/pem_core.fst`.
+`test/tb.fst` contains the top-level wrapper. `-B` recompiles waveform support.
+Change the filter to run another individual test. Multiple filtered tests
+run sequentially in one simulator and one waveform; each test resets its
+bench. The core tests remain black-box even when debug waveforms include
+internal signals.
+
+### Integer-divider protocol timing
+
+Five additional black-box tests measure exact pin-change timestamps, with no
+timing tolerance. Integer divisors 1-9, 15, 16, 17, 31, 255, 256, and 4095
+are exercised. Checks include separate STEP fetch/commit latency, restart
+after idle, 64 consecutive pin transitions without drift, hardware wrapping,
+and encoded delays up to 31 with zero, one, or two side-set lanes.
+
+UART and SPI examples use divisors 3, 5, and 9 and independently constructed
+expected bit sequences. The UART program transmits one start bit, eight
+LSB-first data bits, and one stop bit. Every bit lasts exactly eight execution
+enables. The SPI mode 0 program uses OUT on the low clock phase and IN on the
+high phase, each lasting eight enables; both transmitted and received bytes,
+clock edges, data setup, and chip-select transitions are checked. Pin changes
+are observed continuously, and input/sample checks use simulator timestamps.
+All observations use public ports or architectural CSR readback.
+
+For system clock period `T` and integer divisor `N`, these programs produce
+UART bit periods of `8*N*T` and SPI clock periods of `16*N*T`. An unstalled
+instruction with encoded delay `D` takes `(2 + 2*D)*N*T`. Program overhead,
+FIFO/WAIT stalls, and explicit halt/resume must be accounted for when choosing
+protocol timing. The owner’s divider is still empty, so these results use the
+explicit test-only model; the same tests must run against the supplied RTL.
+
+Run just the integer timing tests from the repository root:
+
+```sh
+make -C test/block-level-tests/L4-PEm-core sim USE_DIVIDER_MODEL=1 \
+    COCOTB_TEST_FILTER=test_integer_divider \
+    COCOTB_RESULTS_FILE=sim_build/divider_model_0/integer-timing-results.xml
+```
+
+For a UART or SPI waveform, add `-B WAVES=1` and filter by
+`test_integer_divider_uart_frame_has_exact_bit_widths` or
+`test_integer_divider_spi_clock_data_and_sample_timing`. Each test runs its
+divisor/data cases sequentially in the same waveform.
 
 ## PEm core functional coverage
 
