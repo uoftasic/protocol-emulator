@@ -26,15 +26,17 @@ jobs:
       - name: Run tests
         run: |
           cd test
-          make clean
-          make
-          # make will return success even if the tests fail, so check results.xml for failed tests
+          # Explicitly use the core's test-only divider until its owner supplies RTL.
+          make clean USE_DIVIDER_MODEL=1
+          make coverage USE_DIVIDER_MODEL=1
           python -m cocotb_tools.check_results results.xml
 
       - name: Test Summary
         uses: test-summary/action@v2.4
         with:
-          paths: "test/results.xml"
+          paths: |
+            test/results.xml
+            test/block-level-tests/*/results.xml
         if: always()
 
       - name: upload waveform and test results
@@ -46,3 +48,6 @@ jobs:
             test/tb.fst
             test/results.xml
             test/output/*
+            test/block-level-tests/*/results.xml
+            test/block-level-tests/*/sim_build/**/coverage/*
+

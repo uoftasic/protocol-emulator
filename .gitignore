@@ -1,5 +1,9 @@
 .DS_Store
 .idea
+.venv/
+venv/
+__pycache__/
+*.py[cod]
 *.vcd
 *.fst
 *.fst.hier
@@ -8,10 +12,22 @@ tt_submission
 src/user_config.json
 src/config_merged.json
 test/sim_build
-test/__pycache__/
 test/results.xml
-test/gate_level_netlist.v
 
-test/block-level-tests/*/*.vcd
-test/block-level-tests/*/*.fst
+test/gate_level_netlist.v
 test/block-level-tests/*/sim_build
+test/block-level-tests/*/results.xml
+test/block-level-tests/*/*.fst
+test/block-level-tests/*/*.vcd
+
+test/block-level-tests/*.vcd
+test/block-level-tests/*.fst
+test/block-level-tests/sim_build
+test/**/obj_dir/
+test/block-level-tests/L4-PEm-core/synth_pem_core.py
+
+# Deferred PEm core structural coverage
+/test/block-level-tests/L4-PEm-core/structural_coverage/
+
+.CONTEXT/
+
