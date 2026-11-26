@@ -1,26 +1,3 @@
-<<<<<<< HEAD
-# Makefile — block-level test: sync_fifo
-# See https://docs.cocotb.org/en/stable/quickstart.html for more info
-
-# defaults
-SIM ?= icarus
-TOPLEVEL_LANG ?= verilog
-SRC_DIR = $(CURDIR)/../../../src/L1-PEm-system/L2-PEm-engine/L3-PEm-core-array/L4-PEm-core/
-PROJECT_SOURCES = pem_core.sv clock_divider.sv
-
-# RTL simulation only (gate-level is done at the top level)
-SIM_BUILD = sim_build/rtl
-VERILOG_SOURCES += $(addprefix $(SRC_DIR)/,$(PROJECT_SOURCES))
-
-# Allow `include files from the source dir
-COMPILE_ARGS += -I$(SRC_DIR)
-
-# No tb.v wrapper needed: cocotb drives the module directly
-COCOTB_TOPLEVEL = sync_fifo
-
-# Test modules, comma-separated, no .py
-COCOTB_TEST_MODULES = test_fifo
-=======
 # Makefile — block-level test: pem_core
 # See https://docs.cocotb.org/en/stable/quickstart.html for more info
 
@@ -86,7 +63,6 @@ ifeq ($(USE_DIVIDER_MODEL),1)
 $(DIVIDER_SOURCE): test_pem_core.py
 	$(PYTHON) test_pem_core.py --write-divider-model $@
 endif
->>>>>>> b76adcae6bc731a61f7d8f5a16769902986cf7d8
 
 # Use a cocotb venv if one exists (override with: make VENV=/path/to/venv)
 VENV ?= $(HOME)/cocotb-env
@@ -94,11 +70,7 @@ ifneq ($(wildcard $(VENV)/bin/cocotb-config),)
 export PATH := $(VENV)/bin:$(PATH)
 endif
 
-<<<<<<< HEAD
-include $(shell PATH="$(PATH)" cocotb-config --makefiles)/Makefile.sim
-=======
 ifneq ($(filter-out lint synth coverage,$(or $(MAKECMDGOALS),sim)),)
 include $(shell PATH="$(PATH)" cocotb-config --makefiles)/Makefile.sim
 endif
 
->>>>>>> b76adcae6bc731a61f7d8f5a16769902986cf7d8
