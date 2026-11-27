@@ -21,7 +21,7 @@ under `test/block-level-tests/`. A failing block fails the shared runner. Each
 block writes its own `results.xml`; the top-level result remains in `test/`.
 `make -C test clean USE_DIVIDER_MODEL=1` also cleans each block's selected build.
 
-`USE_DIVIDER_MODEL=1` explicitly selects the PEm core's test-only Q12.4 divider.
+`USE_DIVIDER_MODEL=1` explicitly selects the core and array test-only Q12.4 dividers.
 The owner's `clock_divider.sv` is currently empty. Once its implementation is
 available, omit this option to test the actual divider. Core ID defaults to zero;
 use `CORE_ID=0`, `1`, `2`, or `3` to select a separately compiled core instance.
@@ -57,6 +57,67 @@ make -C test -B FST= USE_DIVIDER_MODEL=1
 ```
 
 This will generate `tb.vcd` instead of `tb.fst`.
+
+## PEm core array tests
+
+The array regression is in
+`test/block-level-tests/L3-PEm-core-array/test_pem_core_array.py`. All 35 tests,
+bench helpers, and explicit divider-model generation stay in that one Python
+file. Assertions use public flat ports and architectural CSR readback only.
+The bench supplies one shared 32-word instruction image and independent Link
+endpoints, with a free-running 10 ns clock and continuous transfer monitoring.
+
+Checks cover core identity and endpoint packing, CSR write selection/errors,
+FIFO backpressure and diagnostics, every competing core pair and flag in all
+SET/CLEAR combinations, simultaneous updates to distinct flags, coalesced WAIT
+clears, pre-update flag reads, relative addressing, collision W1C/event priority,
+IRQ set-and-wait issue/halt/resume, reset isolation, and independent integer and
+fractional divider timing. A continuous token-ring program transfers three bytes
+per active core through sync flags, Link, and virtual pins at divisors 1, 2,
+3.5, and 5. Programmer SET/CLEAR tests obey the outer router's all-cores-halted
+contract; array tests do not verify that external router's implementation.
+
+From the repository root:
+
+```sh
+# Default four-core array only.
+make -C test/block-level-tests/L3-PEm-core-array test-model
+
+# Compile and test another core count; eight sync flags are required.
+make -C test/block-level-tests/L3-PEm-core-array test-model NUM_CORES=8
+
+# One longer integration test.
+make -C test/block-level-tests/L3-PEm-core-array test-model \
+    COCOTB_TEST_FILTER=test_continuous_token_ring_program_exercises_sync_link_and_pins
+```
+
+On November 27, 2026, the suite passed with these configurations:
+
+| Core count | Passed | Expected skips |
+|---:|---:|---:|
+| 1 | 23 | 12 tests requiring competing cores or IDs 0 and 4 |
+| 4 | 34 | 1 test requiring IDs 0 and 4 |
+| 5 | 35 | 0 |
+| 8 | 35 | 0 |
+| 256 | 1 focused identity test | 0 |
+
+The 256-core check verifies the full MOV CORE_ID byte and its copy/invert/reverse
+forms for IDs 0-255. It does not run the entire pairwise arbitration suite at
+that count. All results use the explicit test-only divider. Repeat against
+the owner's RTL when available by using `sim` without `USE_DIVIDER_MODEL=1`.
+
+The shared Makefile automatically discovers the array block, and the existing
+push workflow includes its result XML. From `test/`, run
+`make USE_DIVIDER_MODEL=1` for all tests or
+`make coverage USE_DIVIDER_MODEL=1` to also collect existing **core** functional
+coverage. The array has no separate coverage percentage collector.
+The shared coverage run and its clean-build repeat passed 123 tests with zero
+failures and two expected skips (UART parity-disabled and the four-core ID 0/4
+check); core functional coverage remains 186/186 selected bins. The CI
+top-level XML check also passed locally.
+Builds live under `test/block-level-tests/L3-PEm-core-array/sim_build/` and the
+default result is `test/block-level-tests/L3-PEm-core-array/results.xml`;
+generated artifacts are ignored by Git.
 
 ## PEm core clock and waveforms
 

@@ -1,7 +1,7 @@
 `default_nettype none
 
 module pem_core #(
-    parameter logic [1:0] CORE_ID = 2'd0
+    parameter int CORE_ID = 0
 ) (
     input  logic        clk,
     input  logic        rst,
@@ -38,7 +38,17 @@ module pem_core #(
     output logic        o_irq_wait_clear
 );
 
+    generate
+        if (CORE_ID < 0 || CORE_ID > 255) begin : g_invalid_core_id
+            initial begin
+                $fatal(1, "CORE_ID must be in the range 0-255 (got %0d)", CORE_ID);
+            end
+        end
+    endgenerate
+
     // -------------------- Registers and internal state --------------------
+
+    localparam logic [1:0] CORE_ID_IRQ_OFFSET = CORE_ID[1:0];
 
     localparam logic [3:0] CSR_SM_CTRL      = 4'h0;
     localparam logic [3:0] CSR_SM_STATUS    = 4'h1;
@@ -411,7 +421,7 @@ module pem_core #(
     assign set_pin_value = rotate_right({3'd0, instruction[4:0]}, 3'd0 - out_base);
     assign source_select = instruction[15:13] == OP_IN ? instruction[7:5] : instruction[2:0];
     assign irq_relative = instruction[15:13] == OP_WAIT ? instruction[4] : instruction[5];
-    assign irq_index = {instruction[2], instruction[1:0] + (irq_relative ? CORE_ID : 2'd0)};
+    assign irq_index = {instruction[2], instruction[1:0] + (irq_relative ? CORE_ID_IRQ_OFFSET : 2'd0)};
     assign execute_attempt = !rst && !core_reset && clk_en &&
                              ((state_q == STATE_EXECUTE && !(halt_requested && !instruction_ready)) ||
                               (state_q == STATE_FROZEN && start_allowed));
@@ -528,7 +538,7 @@ module pem_core #(
                 source_value = 8'd0;
             end
             3'd4: begin
-                source_value = {6'd0, CORE_ID};
+                source_value = CORE_ID[7:0];
             end
             3'd6: begin
                 source_value = isr;
